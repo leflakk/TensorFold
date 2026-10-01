@@ -14,19 +14,33 @@ namespace {
 
 using namespace qmm_frag;
 
+// FP8 MMA and e4m3 conversions exist from sm_89 (Ada); on sm_86 (RTX 30) these bodies trap and the host refuses the
+// FP8 prompt path before any launch (--prefill-fp8 needs 8.9), so the extension still builds there.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#define TF_NO_FP8 1
+#endif
+
 __device__ __forceinline__ void mma8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#ifdef TF_NO_FP8
+    __trap();
+#else
     asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%0, %1, %2, %3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma8z(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#ifdef TF_NO_FP8
+    __trap();
+#else
     const float z = 0.0f;
     asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%10, %10, %10, %10};\n"
         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(z));
+#endif
 }
 
 // e4m3 of the nibbles at bits [s, s + 4) (low byte) and [16 + s, 20 + s) (high byte): f16 1024 + q, minus 1024, cvt.
@@ -35,7 +49,12 @@ __device__ __forceinline__ uint32_t e4m3_pair(uint32_t w, int s) {
     uint32_t h;
     asm("sub.rn.f16x2 %0, %1, %2;\n" : "=r"(h) : "r"(t), "r"(0x64006400u));
     uint16_t r;
+#ifdef TF_NO_FP8
+    r = 0;
+    __trap();
+#else
     asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(r) : "r"(h));
+#endif
     return r;
 }
 
@@ -290,6 +309,8 @@ void dispatch_w8(int tile, const at::Tensor& x, const at::Tensor& a, const at::T
 void qmm_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
                        const at::Tensor& scales, const at::Tensor& biases, at::Tensor& out, int N, int gs, bool f32,
                        int tile) {
+    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor >= 89,
+                "the FP8 prompt matmul needs compute capability 8.9 or newer (FP8 MMA); drop --prefill-fp8 on this GPU");
     if (gs == 64) { if (f32) dispatch<64, true>(tile, x, xs, a, w, scales, biases, out, N); else dispatch<64, false>(tile, x, xs, a, w, scales, biases, out, N); }
     else { if (f32) dispatch<32, true>(tile, x, xs, a, w, scales, biases, out, N); else dispatch<32, false>(tile, x, xs, a, w, scales, biases, out, N); }
 }
@@ -298,6 +319,8 @@ void qmm_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tens
 // ``l64``: 32-input groups read from bytes stored in the 64-input order (MXFP8: one copy for decode and prompts).
 void qmm_prefill8w_cuda(const at::Tensor& x, const at::Tensor& a, const at::Tensor& w, const at::Tensor& scales,
                         at::Tensor& out, int N, int gs, bool f32, int tile, bool l64) {
+    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor >= 89,
+                "the FP8 prompt matmul needs compute capability 8.9 or newer (FP8 MMA); drop --prefill-fp8 on this GPU");
     if (l64) { if (f32) dispatch_w8<32, true, true>(tile, x, a, w, scales, out, N); else dispatch_w8<32, false, true>(tile, x, a, w, scales, out, N); }
     else if (gs == 32) { if (f32) dispatch_w8<32, true>(tile, x, a, w, scales, out, N); else dispatch_w8<32, false>(tile, x, a, w, scales, out, N); }
     else { if (f32) dispatch_w8<64, true>(tile, x, a, w, scales, out, N); else dispatch_w8<64, false>(tile, x, a, w, scales, out, N); }

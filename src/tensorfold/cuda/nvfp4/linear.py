@@ -15,11 +15,11 @@ FP4, FP8, MXFP8, FP8G = 0, 1, 2, 3
 
 @lru_cache(maxsize=1)
 def _ext():
-    from tensorfold.cuda.build import MIN_CAPABILITY, load
+    from tensorfold.cuda.build import FP8, load
 
     here = Path(__file__).parent
     return load(name="tensorfold_nvfp4_v3", sources=[str(here / "qmmf.cpp"), str(here / "qmmf.cu"),
-                                                      str(here / "experts.cu")], need=MIN_CAPABILITY,
+                                                      str(here / "experts.cu")], need=FP8,
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3"], verbose=False)
 
 

@@ -1,4 +1,5 @@
-"""TENSORFOLD_MEMORY_RESERVE_GIB: what the CUDA startup budget leaves free (default max(4 GiB, a tenth of memory))."""
+"""TENSORFOLD_MEMORY_RESERVE_GIB: what the CUDA startup budget leaves free (default max(4 GiB, a tenth of memory);
+a discrete card of 32 GiB or less keeps max(1.5 GiB, a sixteenth))."""
 
 from types import SimpleNamespace
 
@@ -14,8 +15,10 @@ def test_default_reserve_is_unchanged(monkeypatch):
     odd = 121 * GIB + 7                                  # the GPU path rounds a tenth up, the host path down
     assert capacity.reserve_bytes(odd) == -(-odd // 10)
     assert capacity.reserve_bytes(odd, host=True) == odd // 10
-    assert capacity.reserve_bytes(20 * GIB) == 4 * GIB
+    assert capacity.reserve_bytes(20 * GIB) == 3 * GIB // 2
+    assert capacity.reserve_bytes(24 * GIB) == 3 * GIB // 2          # an RTX 3090
     assert capacity.reserve_bytes(20 * GIB, host=True) == 4 * GIB
+    assert capacity.reserve_bytes(48 * GIB) == -(-48 * GIB // 10)
 
 
 def test_override(monkeypatch):
@@ -26,7 +29,7 @@ def test_override(monkeypatch):
     assert capacity.reserve_bytes(121 * GIB) == int(2.5 * GIB)
 
 
-@pytest.mark.parametrize("value", ["1", "0", "-3", "200", "nan", "lots"])
+@pytest.mark.parametrize("value", ["0.5", "0", "-3", "200", "nan", "lots"])
 def test_out_of_range_or_not_a_number_refuses(monkeypatch, value):
     monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", value)
     with pytest.raises(ValueError, match="TENSORFOLD_MEMORY_RESERVE_GIB"):

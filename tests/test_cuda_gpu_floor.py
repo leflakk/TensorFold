@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda import build, capacity  # noqa: E402
 
-GPUS = [((8, 6), "NVIDIA GeForce RTX 3090"), ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"),
+GPUS = [((7, 5), "NVIDIA GeForce RTX 2080 Ti"), ((8, 6), "NVIDIA GeForce RTX 3090"), ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"),
         ((12, 1), "NVIDIA GB10")]
 
 
@@ -19,7 +19,7 @@ def _gpu(monkeypatch, capability, name):
 
 
 @pytest.mark.parametrize("capability,name", GPUS)
-@pytest.mark.parametrize("need", [build.MIN_CAPABILITY, build.CLUSTERS])
+@pytest.mark.parametrize("need", [build.MIN_CAPABILITY, build.FP8, build.CLUSTERS])
 def test_the_startup_check_names_the_gpu(monkeypatch, capability, name, need):
     _gpu(monkeypatch, capability, name)
     if capability < need:
@@ -37,10 +37,12 @@ def test_no_gpu_leaves_it_to_the_engine(monkeypatch):
 
 @pytest.mark.parametrize("quantization", [{"group_size": 64, "bits": 4}, {"quant_method": "compressed-tensors"},
                                           {"quant_method": "modelopt", "quant_algo": "NVFP4"}])
-def test_every_checkpoint_runs_from_ada(tmp_path, quantization):
+def test_checkpoints_run_from_ampere_fp8_ones_from_ada(tmp_path, quantization):
     key = "quantization" if "bits" in quantization else "quantization_config"
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5", key: quantization}))
-    assert capacity.floor(tmp_path) == build.MIN_CAPABILITY == (8, 9)
+    want = build.FP8 if quantization.get("quant_method") == "modelopt" else build.MIN_CAPABILITY
+    assert capacity.floor(tmp_path) == want
+    assert build.MIN_CAPABILITY == (8, 6) and build.FP8 == (8, 9)
 
 
 def test_an_nvfp4_checkpoint_below_ada_is_refused_before_any_weight_loads(monkeypatch, tmp_path):

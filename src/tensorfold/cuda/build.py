@@ -10,7 +10,8 @@ import sys
 import threading
 from typing import Any
 
-MIN_CAPABILITY = (8, 9)         # FP8 MMA and e4m3 conversions (Ada); kernels with clusters use them from 9.0
+MIN_CAPABILITY = (8, 6)         # Ampere RTX 30 (cp.async, ldmatrix, bf16 MMA); FP8 paths check FP8 themselves
+FP8 = (8, 9)                    # FP8 MMA and e4m3 conversions (Ada): the FP8 prompt matmuls and FP8/NVFP4 checkpoints
 CLUSTERS = (9, 0)               # extensions built only on thread-block clusters (NVFP4) need Hopper or newer
 # stop first: when the lock goes, a waiting start imports whatever module is there without building, even an old one
 HINT = "if no other build is running, a killed build left it: stop this start, delete the lock and start again"
@@ -24,7 +25,7 @@ def arch_flags(need: tuple[int, int] = MIN_CAPABILITY, arch_specific: bool = Fal
 
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < need:
-        why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA"
+        why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA" if need >= FP8 else "bf16 MMA and cp.async"
         raise RuntimeError(f"TensorFold's CUDA kernels need compute capability {need[0]}.{need[1]} or newer ({why}"
                            f"{' for these weights' if need > MIN_CAPABILITY else ''}); this GPU "
                            f"({torch.cuda.get_device_name()}) is {major}.{minor}")
@@ -180,4 +181,4 @@ def _say(text: str) -> None:
     print(f"[tensorfold] {text}", flush=True)
 
 
-__all__ = ["CLUSTERS", "MIN_CAPABILITY", "arch_flags", "load", "pip_toolkit"]
+__all__ = ["CLUSTERS", "FP8", "MIN_CAPABILITY", "arch_flags", "load", "pip_toolkit"]

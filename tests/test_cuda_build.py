@@ -38,9 +38,18 @@ def test_the_flags_name_only_this_gpu(monkeypatch):
 
 @pytest.mark.torch
 def test_an_older_gpu_is_refused_by_name(monkeypatch):
-    _gpu(monkeypatch, (8, 6), "NVIDIA GeForce RTX 3090")
-    with pytest.raises(RuntimeError, match=r"capability 8\.9 or newer \(FP8 MMA\).*RTX 3090.*is 8\.6"):
+    _gpu(monkeypatch, (7, 5), "NVIDIA GeForce RTX 2080 Ti")
+    with pytest.raises(RuntimeError, match=r"capability 8\.6 or newer \(bf16 MMA and cp\.async\).*RTX 2080 Ti.*is 7\.5"):
         build.arch_flags()
+    with pytest.raises(RuntimeError, match=r"capability 8\.9 or newer \(FP8 MMA for these weights\)"):
+        _gpu(monkeypatch, (8, 6), "NVIDIA GeForce RTX 3090")
+        build.arch_flags(build.FP8)
+
+
+@pytest.mark.torch
+def test_ampere_rtx30_builds(monkeypatch):
+    _gpu(monkeypatch, (8, 6), "NVIDIA GeForce RTX 3090")
+    assert build.arch_flags() == ["-gencode=arch=compute_86,code=sm_86"]
 
 
 @pytest.mark.torch
@@ -152,8 +161,8 @@ def test_a_build_directory_argument_is_the_one_checked(ext, tmp_path):
 
 @pytest.mark.torch
 def test_an_older_gpu_is_refused_before_any_line(ext, monkeypatch):
-    _gpu(monkeypatch, (8, 6), "NVIDIA GeForce RTX 3090")
-    with pytest.raises(RuntimeError, match="RTX 3090"):
+    _gpu(monkeypatch, (7, 5), "NVIDIA GeForce RTX 2080 Ti")
+    with pytest.raises(RuntimeError, match="RTX 2080 Ti"):
         ext.build.load(name="tf_test", sources=ext.sources, verbose=False)
     assert ext.said == [] and ext.calls == []
 

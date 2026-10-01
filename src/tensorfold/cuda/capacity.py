@@ -161,13 +161,15 @@ def reserve_bytes(total: int, *, host: bool = False) -> int:
 
     value = os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB", "").strip()
     if not value:
+        if not host and total <= 32 * GIB:      # a 24 GB card (RTX 3090/4090): a tenth would idle 2.4 of its GiB
+            return max(3 * GIB // 2, math.ceil(total / 16))
         return max(4 * GIB, total // 10 if host else math.ceil(total / 10))
     try:
         gib = float(value)
     except ValueError:
         gib = math.nan
-    if not 2 <= gib <= total / GIB:
-        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 2 to the memory's size")
+    if not 1 <= gib <= total / GIB:
+        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 1 to the memory's size")
     return int(gib * GIB)
 
 
@@ -266,10 +268,17 @@ def choose(plan: Plan, peers: list[list[int]] | None = None) -> int:
 
 
 def floor(model_dir: str | Path) -> tuple[int, int]:
-    """The compute capability a checkpoint's kernels need: 8.9 for every format (clusters are taken where present)."""
+    """The compute capability a checkpoint's kernels need: 8.6 (RTX 30) for MLX and EXL3, 8.9 for FP8/NVFP4 ones."""
 
     from tensorfold.cuda import build
 
+    try:
+        from tensorfold.families import quant_method, read_config
+
+        if quant_method(read_config(Path(model_dir))) == "modelopt":
+            return build.FP8
+    except Exception:  # noqa: BLE001 - no readable config here: the later checks name it
+        pass
     return build.MIN_CAPABILITY
 
 
