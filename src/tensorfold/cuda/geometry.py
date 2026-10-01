@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 
 from .capacity import Geometry, Weights, headers, itemsize
@@ -68,7 +69,24 @@ def with_fixed(geometry: Geometry, extra: int) -> Geometry:
     return Geometry(lambda slots: geometry.bytes_at(slots) + extra, geometry.reserve, geometry.minimum_slots)
 
 
-def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
+def share(total: int, world: int, unit: int = 32) -> int:
+    """The widest rank's share of ``total`` split in whole ``unit``s (Flash Next's expert widths: 640 over 8 is 96)."""
+
+    units = -(-int(total) // unit)
+    return -(-units // world) * unit if total % unit == 0 else -(-int(total) // world)
+
+
+def fast_partials(world: int) -> bool:
+    """Whether ranks on this host sum partials in shared memory (no [world, rows, D] gathers on the GPU)."""
+
+    return world > 1 and os.environ.get("TF_LOCAL_RANKS") == "1" and \
+        os.environ.get("TF_COMM", "shm").strip().lower() == "shm"
+
+
+def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True, *, kv_heads: int = 2):
+    def expert(n: int) -> int:                  # an axis holding the expert width (or its 4-bit words / groups)
+        return -(-n * share(640, world) // 640) if world > 1 else n
+
     def transform(name: str, info: dict) -> tuple[int, int]:
         if "vision" in name or ".visual." in name or (not mtp and (name.startswith("mtp.") or ".mtp." in name)):
             return 0, 0
@@ -78,10 +96,12 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
         if world > 1 and not info.get("split"):
             if ".switch_mlp." in name or ".shared_expert." in name:
                 axis = -1 if ".down_proj." in name else -2
-                shape[axis] //= world
+                shape[axis] = expert(shape[axis])            # whole 32-groups: 8 ranks' widest is 96 of 640
             elif ".indexer." not in name and (".self_attn." in name or ".linear_attn." in name):
-                if any(f".{part}." in name for part in ("q_proj", "k_proj", "v_proj", "in_proj_qkv", "in_proj_z",
-                                                        "in_proj_a", "in_proj_b", "conv1d")):
+                if any(f".{part}." in name for part in ("k_proj", "v_proj")):
+                    shape[0] = shape[0] * max(1, kv_heads // world) // kv_heads     # a group shares a KV head
+                elif any(f".{part}." in name for part in ("q_proj", "in_proj_qkv", "in_proj_z",
+                                                          "in_proj_a", "in_proj_b", "conv1d")):
                     shape[0] //= world
                 elif any(f".{part}." in name for part in ("o_proj", "out_proj")):
                     shape[-1] //= world
@@ -163,7 +183,7 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
 
     linear, attention = layer_counts(t)
     d, h = int(t["hidden_size"]), int(t["num_attention_heads"]) // world
-    hk = int(t["num_key_value_heads"]) // world
+    hk = max(1, int(t["num_key_value_heads"]) // world)          # more ranks than KV heads: one a rank
     hd = int(t.get("head_dim") or d // int(t["num_attention_heads"]))
     nk, nv = int(t["linear_num_key_heads"]) // world, int(t["linear_num_value_heads"]) // world
     dk, dv = int(t["linear_key_head_dim"]), int(t["linear_value_head_dim"])
@@ -178,7 +198,7 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
     fixed += linear * rows * (width * 2 + nk * dk * 4 + nv * dv * 4 + nv * 8)
     # Bound the concurrent activation arrays, MoE expert rows, logits and split-K scratch.
     slots = int(t.get("num_experts_per_tok", 1)) + 1
-    intermediate = int(t.get("moe_intermediate_size", t.get("intermediate_size", d))) // world
+    intermediate = share(int(t.get("moe_intermediate_size", t.get("intermediate_size", d))), world)
     extent = d * streams + int(t["vocab_size"]) // world + slots * (intermediate + d) + width + h * hd
     fixed += max(16 * rows * extent * 4, prompt * prompt_row_bytes(t, world) if prompt else 0)
     fixed += (2 if mtp else 1) * 32 * rows * 2560 * 4
@@ -217,7 +237,8 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
     heads, dim = int(t.get("indexer_n_heads", 4)), int(t.get("indexer_head_dim", 128))
     experts, low = int(t.get("num_experts", 1)), int(t.get("hc_lowrank", 320))
     ple = int(t.get("ple_embed_dim") or d)
-    return (21 * streams * d + (12 + 12 * world) * d + 4 * ple + 12 * h * hd + 4 * hk * hd + 6 * heads * dim
+    gathered = 1 if fast_partials(world) else world      # shared-memory sums hold no [world, rows, D] gathers
+    return (21 * streams * d + (12 + 12 * gathered) * d + 4 * ple + 12 * h * hd + 4 * hk * hd + 6 * heads * dim
             + 4 * experts + slots * (2 * moe + 2 * d + 24 + experts // 256) + 2 * width + 3 * nv * dv + 8 * low
             + 12 * streams + 64)
 
@@ -227,7 +248,7 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
 
     _, h, hk, hd, _, nv, _, dv, width = _gdn_dims(t, world)
     slots = int(t.get("num_experts_per_tok", 1)) + 1
-    moe = int(t.get("moe_intermediate_size", t.get("intermediate_size", t["hidden_size"]))) // world
+    moe = share(int(t.get("moe_intermediate_size", t.get("intermediate_size", t["hidden_size"]))), world)
     return rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, moe)
 
 
@@ -373,7 +394,7 @@ def _gdn_dims(t: dict, world: int) -> tuple:
     d, heads = int(t["hidden_size"]), int(t["num_attention_heads"])
     nk, nv = int(t["linear_num_key_heads"]) // world, int(t["linear_num_value_heads"]) // world
     dk, dv = int(t["linear_key_head_dim"]), int(t["linear_value_head_dim"])
-    return (d, heads // world, int(t["num_key_value_heads"]) // world, int(t.get("head_dim") or d // heads),
+    return (d, heads // world, max(1, int(t["num_key_value_heads"]) // world), int(t.get("head_dim") or d // heads),
             nk, nv, dk, dv, 2 * nk * dk + 2 * nv * dv + 2 * nv)
 
 

@@ -36,12 +36,13 @@ def _library() -> ctypes.CDLL:
 
 
 class NCCL:
-    def __init__(self, rank: int, world: int, master: str, port: int) -> None:
+    def __init__(self, rank: int, world: int, master: str, port: int, *, local: bool = False) -> None:
         from datetime import timedelta
 
         from torch.distributed import TCPStore
 
         self.rank, self.world = rank, world
+        self.local = bool(local)          # every rank on this host (one process a GPU): shared memory reaches them
         self.lib = _library()
         lib = self.lib
         lib.ncclGetErrorString.restype = ctypes.c_char_p
@@ -66,11 +67,34 @@ class NCCL:
         if code != 0:
             raise RuntimeError(f"NCCL error {code}: {self.lib.ncclGetErrorString(code).decode()}")
 
+    fast = None          # a ``fastcomm.FastComm`` once ``use_fast`` set it up (ranks on one host)
+
+    def use_fast(self, cap: int) -> bool:
+        """Route collectives through shared host memory (ranks on this host, TF_COMM=shm); False keeps NCCL."""
+
+        from tensorfold.cuda import fastcomm
+
+        if self.world == 1 or not fastcomm.enabled() or not getattr(self, "local", False):
+            return False
+        self.fast = fastcomm.FastComm(self.store, self.rank, self.world, cap)
+        return True
+
+    def reduce(self, part: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """out = every rank's ``part`` summed in rank order in fp32 (shared memory only; NCCL callers gather)."""
+
+        if self.fast is None:
+            raise RuntimeError("reduce runs on the shared-memory collectives (TF_COMM=shm, ranks on one host)")
+        return self.fast.reduce(part, out)
+
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         """recv [world * n] <- every rank's send [n], in rank order (contiguous tensors, same dtype)."""
 
         if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
             raise ValueError("all_gather: recv must hold world x send of the same dtype")
+        if self.fast is not None and send.is_contiguous() and (send.numel() * send.element_size()) % 4 == 0 \
+                and send.numel() * send.element_size() <= self.fast.cap:
+            self.fast.all_gather(send, recv)
+            return
         stream = torch.cuda.current_stream().cuda_stream
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))

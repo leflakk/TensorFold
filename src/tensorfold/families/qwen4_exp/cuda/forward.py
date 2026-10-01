@@ -202,6 +202,11 @@ def _out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tens
         if got.dim() == 3:
             return 4, got            # K slices: the write-back sums them in order (the bits of reduce, then round)
         return 1, got
+    if b.fast:                       # ranks on one host: the rank-ordered sum, rounded once to bf16 (mode 3's bits)
+        part = b.part_branch16 if b.prefill else b.part_branch
+        _mm(x, q, xs, part[:R], b, f32=part.dtype == torch.float32)
+        w.comm.reduce(part[:R], b.branch[:R])
+        return 1, b.branch[:R]
     _mm(x, q, xs, b.part_branch[:R], b, f32=True)
     return 3, _gather(w, b, b.part_branch, b.g_branch, R)
 
@@ -328,6 +333,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
         buf = moe_mod.moe(b.mixed[:R], m.router, m.experts, b.moe, w.cfg.top_k, w.cfg.experts)
     if w.comm is None:
         return 2, buf.y[:R], buf.wts[:R]
+    if b.fast:
+        part = b.part_moe16 if b.prefill else b.part_moe
+        glue.moe_partial(buf.y[:R], buf.wts[:R], part, R)
+        w.comm.reduce(part[:R], b.red_moe[:R])
+        return 1, b.red_moe[:R], None
     glue.moe_partial(buf.y[:R], buf.wts[:R], b.part_moe, R)
     return 3, _gather(w, b, b.part_moe, b.g_moe, R), None
 

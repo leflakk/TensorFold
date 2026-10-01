@@ -45,8 +45,8 @@ class FlashNextEngine:
 
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
-            raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
-                             "2, or serve the MLX checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
+            raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp, "
+                             "or serve the MLX checkpoint (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP) on 2, 4 or 8")
         if vision and (streams < 2 or tp != 1):
             raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more")
         if exl3 and ple_on_ssd:
@@ -59,10 +59,12 @@ class FlashNextEngine:
         from tensorfold.cuda.capacity import admit, config, gather_ints
         from tensorfold.cuda.geometry import PREFILL_ROWS, gdn_geometry, indexed_stream_geometry, indexed_weights
 
-        if tp not in (1, 2) or rank not in range(tp):
-            raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
+        from .tp import WORLDS
+
+        if tp not in WORLDS or rank not in range(tp):
+            raise ValueError(f"rank {rank} of {tp}: Flash Next runs on {', '.join(map(str, WORLDS))} GPUs")
         if streams > 1 and tp > 1:
-            raise ValueError("--parallel decodes several Flash Next requests together on one GPU; with --tp 2 it "
+            raise ValueError(f"--parallel decodes several Flash Next requests together on one GPU; with --tp {tp} it "
                              "serves one request at a time for now, so drop --parallel")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
@@ -74,14 +76,18 @@ class FlashNextEngine:
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
         ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
-        if tp == 2:
+        if tp > 1:
+            import os
+
             from tensorfold.cuda.comm import NCCL
 
             if not master:
-                raise ValueError("two ranks need rank 0's address (master)")
-            self.comm = NCCL(rank, 2, master, port)
+                raise ValueError(f"{tp} ranks need rank 0's address (master)")
+            # ``tensorfold serve --tp N`` without --master starts every rank on this host (TF_LOCAL_RANKS=1)
+            local = os.environ.get("TF_LOCAL_RANKS") == "1"
+            self.comm = NCCL(rank, tp, master, port, local=local)
             self.comm.barrier()
-        gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
+        gather = (lambda values: gather_ints(torch, self.comm.all_gather, values, world=tp)) if tp > 1 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
@@ -95,7 +101,9 @@ class FlashNextEngine:
         workspace = vision_workspace() if vision else 0
         self.capacity_plan = admit(model_dir, max_len, context_explicit, torch,
                                    capacity_geometry(geometry, model_dir, vision, rank, workspace),
-                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
+                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd,
+                                                                 kv_heads=int(config(model_dir)["num_key_value_heads"])),
+                                                 vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
         self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else prompt_plan(
@@ -106,17 +114,31 @@ class FlashNextEngine:
             print(f"[tensorfold] {self.prefill_rows}-row idle prompt workspace {prompt_workspace / 2**30:.2f} GiB; "
                   f"planned peak {peak:.2f} GiB at the admitted window", flush=True)
         self.max_len = self.capacity_plan["cache_slots"]
-        if tp == 2:
+        if tp > 1:
             self._same_settings(torch, ids)
+            # every partial sum and gather through shared host memory when the ranks share this host: a prompt
+            # chunk's partials (bf16 or fp32), a window's fp32 ones, or gathered sampling candidates fit
+            from tensorfold.cuda.geometry import PREFILL_ROWS as _ROWS
+            from .state import prefill_partials
+
+            hidden = int(config(model_dir)["hidden_size"])
+            cap = max(max(self.prefill_rows, _ROWS) * hidden * (2 if prefill_partials() == "bf16" else 4),
+                      64 * hidden * 4, 8 << 20)
+            self.comm.barrier()
+            if self.comm.use_fast(cap):
+                print(f"[tensorfold] rank {rank} of {tp}: partial sums through shared host memory "
+                      f"({self.comm.fast.bytes / 2**20:.0f} MiB region; TF_COMM=nccl uses NCCL)", flush=True)
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all
 
         reads: list = []                              # the n-gram tables' pages, read while the weights load
         try:
-            w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
+            # one rank a host reads the n-gram tables ahead: the others map the same page cache
+            self.table_host = prefetch and not ple_on_ssd and (rank == 0 or not getattr(self.comm, "local", False))
+            w = load(model_dir, mtp=self.depth > 0, tp=(rank, tp) if tp > 1 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
-                     table_reads=reads if prefetch and not ple_on_ssd else None)
+                     table_reads=reads if self.table_host else None)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
@@ -162,11 +184,17 @@ class FlashNextEngine:
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
         started = time.perf_counter()
         locked = False
-        if prefetch and not ple_on_ssd:               # the n-gram tables' pages, read now rather than by requests
+        if self.table_host:                           # the n-gram tables' pages, read now rather than by requests
             tables = {id(layer.ple.table): layer.ple.table for layer in w.layers if layer.ple is not None}
             size = sum(t.nbytes for t in tables.values())
-            # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
+            # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for (a
+            # discrete GPU's budget is its own memory: the host's free memory, less 8 GiB, decides there)
             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
+            from tensorfold.cuda.capacity import _meminfo, unified
+
+            memory = _meminfo()
+            if not unified(torch) and memory is not None:
+                room = memory["MemAvailable"] - 8 * 2**30
             for table in tables.values():
                 if not tables_read:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
@@ -216,22 +244,26 @@ class FlashNextEngine:
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
                              int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
-        both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
-        self.comm.all_gather(mine, both)
-        both = both.view(2, -1).cpu()
-        prompt_precision.same_on_ranks(int(both[0, -1]), int(both[1, -1]))
-        if not torch.equal(both[0], both[1]):
-            raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"draft vocabulary, KV cache): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
+        world = self.comm.world
+        every = torch.empty((world * mine.numel(),), dtype=torch.int64, device="cuda")
+        self.comm.all_gather(mine, every)
+        every = every.view(world, -1).cpu()
+        for r in range(1, world):
+            prompt_precision.same_on_ranks(int(every[0, -1]), int(every[r, -1]))
+            if not torch.equal(every[0], every[r]):
+                raise RuntimeError(f"the ranks were started with different settings (drafts, confidence, context, "
+                                   f"draft vocabulary, KV cache): rank 0 {every[0].tolist()}, rank {r} "
+                                   f"{every[r].tolist()}")
 
     def _key(self, n: int) -> str:
         return f"tensorfold/flashnext/request/{n}"
 
     def shutdown(self) -> None:
-        """Rank 0: tell rank 1 to leave ``follow``."""
+        """Rank 0: tell the other ranks to leave ``follow``."""
 
-        if self.tp == 2 and self.rank == 0:
-            self.comm.store.set(self._key(self.served), json.dumps({"stop": True}))
+        if self.tp > 1 and self.rank == 0:
+            for r in range(1, self.tp):
+                self.comm.store.set(f"{self._key(self.served)}/{r}", json.dumps({"stop": True}))
 
     def _share(self, prompt: list[int], max_tokens: int, sampling, draft: bool, cached: int, constraint=None,
                stop_eos: bool = True) -> tuple:
@@ -246,19 +278,20 @@ class FlashNextEngine:
                                                            float(sampling.min_p)],
                 "grammar": pack(constraint)}                 # rank 1 walks and masks the same rows
         text = json.dumps(body)
-        self.comm.store.set(self._key(self.served), text)
+        for r in range(1, self.tp):                          # one key a follower: each deletes its own
+            self.comm.store.set(f"{self._key(self.served)}/{r}", text)
         return self._unpack(text)
 
     def _receive(self) -> tuple | None:
         from torch.distributed import DistNetworkError
 
-        key = self._key(self.served)
+        key = f"{self._key(self.served)}/{self.rank}"
         while True:
             try:
                 self.comm.store.wait([key], timedelta(hours=1))
                 break
             except DistNetworkError:                        # rank 0 is gone: leave ``follow``
-                print("[tensorfold] rank 0 closed the connection; rank 1 stops", flush=True)
+                print(f"[tensorfold] rank 0 closed the connection; rank {self.rank} stops", flush=True)
                 return None
             except Exception:                               # noqa: BLE001  (no request within the hour: wait on)
                 continue
@@ -401,7 +434,7 @@ class FlashNextEngine:
                                          **({"vision": vision} if vision is not None else {}))
         hit = self._resume(prompt) if draft else None
         points = None
-        if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1
+        if self.tp > 1:                      # rank 0 decodes exactly what it hands the other ranks
             prompt, max_tokens, sampling, draft, _, _, stop_eos, points = self._share(
                 prompt, max_tokens, sampling, draft, len(hit[0]) if hit else 0, constraint, stop_eos)
             self.served += 1
@@ -431,7 +464,7 @@ class FlashNextEngine:
                 hit = next(((ids, snap) for ids, snap in self.cache if len(ids) == cached and prompt[:cached] == ids),
                            None)
                 if hit is None:
-                    raise RuntimeError(f"rank 1 has no kept state for the {cached} tokens rank 0 resumes from")
+                    raise RuntimeError(f"rank {self.rank} has no kept state for the {cached} tokens rank 0 resumes from")
             try:
                 if draft:
                     self._decode(prompt, max_tokens, sampling, None, hit, constraint, stop_eos, points=points)

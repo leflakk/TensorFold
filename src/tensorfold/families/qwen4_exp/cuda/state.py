@@ -19,6 +19,17 @@ ATT_ROWS = 256  # prompt attention runs in blocks of this many rows (its partial
 ENDS = 16       # prompts one prompt pass can end (each ending prompt's last row gets the head)
 
 
+def prefill_partials() -> str:
+    """The partial sums prompt chunks send between ranks: bf16 (default, half the bytes) or fp32 (TF_PREFILL_PARTIALS)."""
+
+    import os
+
+    value = os.environ.get("TF_PREFILL_PARTIALS", "bf16").strip().lower()
+    if value not in ("bf16", "fp32"):
+        raise ValueError(f"TF_PREFILL_PARTIALS={value!r}: bf16 or fp32")
+    return value
+
+
 class Buffers:
     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
 
@@ -76,11 +87,19 @@ class Buffers:
         self.logits = torch.empty((head_rows, w.head.n), dtype=bf, device=dev)
         world = int(w.meta.get("world", 1))
         self.world = world
+        # ranks on one host sum partials in shared memory (``comm.reduce``): no [world, rows, D] gathers to hold
+        self.fast = world > 1 and getattr(getattr(w, "comm", None), "fast", None) is not None
         if world > 1:                  # tensor parallel: fp32 partials and their rank-ordered gathers
             self.part_branch = torch.empty((rows, c.hidden), dtype=f32, device=dev)
             self.part_moe = torch.empty((rows, c.hidden), dtype=f32, device=dev)
-            self.g_branch = torch.empty((world * rows * c.hidden,), dtype=f32, device=dev)
-            self.g_moe = torch.empty((world * rows * c.hidden,), dtype=f32, device=dev)
+            if self.fast:              # prompt chunks send bf16 partials (half the PCIe bytes), summed in fp32
+                p16 = prefill and prefill_partials() == "bf16"
+                self.part_branch16 = self.part_branch.to(bf) if p16 else self.part_branch
+                self.part_moe16 = self.part_moe.to(bf) if p16 else self.part_moe
+                self.red_moe = torch.empty((rows, c.hidden), dtype=bf, device=dev)
+            else:
+                self.g_branch = torch.empty((world * rows * c.hidden,), dtype=f32, device=dev)
+                self.g_moe = torch.empty((world * rows * c.hidden,), dtype=f32, device=dev)
             self.cand = torch.empty((head_rows, 2 * CAND + 1), dtype=f32, device=dev)
             self.cand_all = torch.empty((world * head_rows * (2 * CAND + 1),), dtype=f32, device=dev)
         # n-gram embedding

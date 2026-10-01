@@ -43,9 +43,15 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
-    cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
+    from . import tp as plan
+
+    plan.check(full, world)
+    kv_lo, kv_n = plan.kv_span(full.kv_heads, world, rank)
+    moe_lo, moe_hi = plan.span(full.moe_width, world, rank, 32)            # this rank's expert columns
+    sh_lo, sh_hi = plan.span(full.shared_width, world, rank, 32)
+    cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=kv_n,
                                           nk=full.nk // world, nv=full.nv // world,
-                                          moe_width=full.moe_width // world, shared_width=full.shared_width // world)
+                                          moe_width=moe_hi - moe_lo, shared_width=sh_hi - sh_lo)
     rd = _Reader(model_dir, device)
     prefix = "language_model." if rd.has("language_model.model.embed_tokens.weight") else ""
     # NVFP4 names the language model ``model.language_model.*``; its lm_head and mtp sit at the top level
@@ -227,10 +233,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         sw, ss, sb = triple(name + ".shared_expert_gate")
         shared_gate = dequantize(sw, ss, sb).to(torch.bfloat16)
         router = torch.cat([gate_rows, shared_gate]).contiguous()
-        w_, sw_ = full.moe_width, full.shared_width
-        # a rank takes its half of every expert's intermediate width: gate/up rows, down input groups
-        gu = lambda t, width: _rows(t, rank * width // world, (rank + 1) * width // world)          # noqa: E731
-        dn = lambda t, width: _groups(t, rank * width // world // 32, (rank + 1) * width // world // 32)  # noqa: E731
+        w_, sw_ = (moe_lo, moe_hi), (sh_lo, sh_hi)
+        # a rank takes its share of every expert's intermediate width (whole 32-groups): gate/up rows, down groups
+        gu = lambda t, cols: _rows(t, cols[0], cols[1])                        # noqa: E731
+        dn = lambda t, cols: _groups(t, cols[0] // 32, cols[1] // 32)          # noqa: E731
         def table(routed, shared):
             return tuple(torch.cat([r, t[None]]) for r, t in zip(routed, shared))
 
@@ -319,10 +325,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
 
     def attention(name: str) -> AttnW:
         hd = full.head_dim
-        hl, kl = full.heads // world, full.kv_heads // world
+        hl = full.heads // world
         q = _rows(triple(name + ".q_proj"), rank * hl * 2 * hd, (rank + 1) * hl * 2 * hd)
-        k = _rows(triple(name + ".k_proj"), rank * kl * hd, (rank + 1) * kl * hd)
-        v = _rows(triple(name + ".v_proj"), rank * kl * hd, (rank + 1) * kl * hd)
+        # the KV heads this rank's query heads read (with more ranks than KV heads, a group shares one)
+        k = _rows(triple(name + ".k_proj"), kv_lo * hd, (kv_lo + kv_n) * hd)
+        v = _rows(triple(name + ".v_proj"), kv_lo * hd, (kv_lo + kv_n) * hd)
         proj = stack_q4([q, k, v, triple(name + ".indexer.index_qk_proj")])          # the indexer: every rank
         o = _groups(triple(name + ".o_proj"), rank * hl * hd // 32, (rank + 1) * hl * hd // 32)
         return AttnW(proj, cscale(name + ".q_norm.weight"), cscale(name + ".k_norm.weight"),
