@@ -18,9 +18,12 @@ _DT = {"U32": torch.int32, "I32": torch.int32, "BF16": torch.bfloat16, "F16": to
 class _Reader:
     """Read checkpoint shards sequentially (O_DIRECT where allowed) and release each shard's cached pages."""
 
-    def __init__(self, model_dir: Path, device: str) -> None:
+    def __init__(self, model_dir: Path, device: str, *, shared: bool = False) -> None:
         from tensorfold.cuda.direct_read import ReadAhead, Reader
 
+        # ``shared``: several ranks of this host read the same shards; buffered reads let the first fill the page
+        # cache for the others (O_DIRECT would read the checkpoint from disk once a rank), and no rank drops it
+        self.shared = shared
         index = json.loads((model_dir / "model.safetensors.index.json").read_text())
         self.where = index["weight_map"]
         self.dir = model_dir
@@ -28,6 +31,8 @@ class _Reader:
         self.headers: dict[str, tuple[int, dict]] = {}
         self.touched: set[str] = set()
         self.io = Reader()
+        if shared:
+            self.io.direct = False
         self.reads = ReadAhead(self.io)
 
     def queue(self, names) -> None:
@@ -89,6 +94,9 @@ class _Reader:
     def release(self) -> None:
         """Drop read shards' cached pages so unified memory does not retain both host-cache and GPU copies."""
 
+        if self.shared:                       # the other ranks of this host read the same pages next
+            self.touched.clear()
+            return
         for shard in list(self.touched):
             try:
                 fd = os.open(self.dir / shard, os.O_RDONLY)

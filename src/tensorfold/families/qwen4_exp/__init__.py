@@ -9,9 +9,10 @@ MODEL_TYPES = ("qwen4_exp", "qwen3_8_flash_next")   # the second: the name newer
 TITLE = "Qwen3.8 Flash Next"
 LANES = True
 # with their MTP head: MLX affine (4-bit the default; oQ4e, oQ5e, 6- and 8-bit read too), EXL3 and NVFP4
-MODELS = ("Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP", "turboderp/Qwen3.8-Flash-Next-exl3",
-          "local-inference-lab/Qwen3.8-Flash-Next-NVFP4", "RadixArk/Qwen3.8-Flash-Next-NVFP4")
-NVFP4_MODELS = MODELS[2:]
+MODELS = ("TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP", "Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+          "turboderp/Qwen3.8-Flash-Next-exl3", "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+          "RadixArk/Qwen3.8-Flash-Next-NVFP4")
+NVFP4_MODELS = MODELS[3:]
 QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt")}  # MLX affine 4-bit, EXL3 packs and NVFP4 (ModelOpt)
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.flash_next.v1"

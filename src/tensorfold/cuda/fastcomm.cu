@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 
 namespace {
 
@@ -276,6 +277,206 @@ __global__ void __launch_bounds__(THREADS) gather_kernel(const uint32_t* __restr
     finish(c, ep);
 }
 
+// ---- LL ("low latency") forms: every 16-byte store carries two 4-byte payloads, each beside the call's number, so a
+// reader polls the data itself: no fence, no flag, one PCIe round trip a phase (NCCL's LL protocol over host memory).
+constexpr int LL_THREADS = 256;
+constexpr int U = 4;                  // elements a thread takes a step: 2 lines of fp32 or 1 of bf16
+
+__device__ __forceinline__ void st_ll(void* p, uint32_t a, uint32_t b, uint32_t f) {
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};\n" ::"l"(p), "r"(a), "r"(f), "r"(b), "r"(f)
+                 : "memory");
+}
+
+__device__ __forceinline__ uint4 ld_ll(const void* p) {
+    uint4 v;
+    asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
+template <typename T> struct LL;
+template <> struct LL<float> { static constexpr int LINES = 2; };            // U fp32: 2 lines of 2
+template <> struct LL<__nv_bfloat16> { static constexpr int LINES = 1; };    // U bf16: 1 line of 4
+
+// U elements of a local tensor -> its payload words (2 a line)
+template <typename T>
+__device__ __forceinline__ void payload(const T* x, long long e, uint32_t* w) {
+    const uint4 v = *reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(x) + e * sizeof(T) -
+                                                    (e * sizeof(T)) % 16);
+    if constexpr (sizeof(T) == 4) {          // 4 fp32 = the whole 16 bytes
+        w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w;
+    } else {                                 // 4 bf16 = half of the 16 bytes holding them
+        const bool hi = (e * sizeof(T)) % 16 != 0;
+        w[0] = hi ? v.z : v.x; w[1] = hi ? v.w : v.y;
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void unpack_u(const uint32_t* w, float* f) {
+    if constexpr (sizeof(T) == 4) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) f[i] = __uint_as_float(w[i]);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) { f[2 * i] = __uint_as_float(w[i] << 16); f[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u); }
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void pack_u(const float* f, uint32_t* w) {
+    if constexpr (sizeof(T) == 4) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[i] = __float_as_uint(f[i]);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const __nv_bfloat162 h = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+            w[i] = *reinterpret_cast<const uint32_t*>(&h);
+        }
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void store_u(T* out, long long e, const uint32_t* w) {
+    if constexpr (sizeof(T) == 4) *reinterpret_cast<uint4*>(out + e) = make_uint4(w[0], w[1], w[2], w[3]);
+    else *reinterpret_cast<uint2*>(out + e) = make_uint2(w[0], w[1]);
+}
+
+// line ``i``'s U elements as published by rank r at ``base`` (spinning until they carry ``ep``)
+__device__ __forceinline__ void spin_timeout(const Ctx& c, unsigned long long& t0, int& spins, int r, uint32_t ep) {
+    if (++spins % 4096 == 0) {
+        const unsigned long long now = now_ns();
+        if (t0 == 0) t0 = now;
+        else if (now - t0 > static_cast<unsigned long long>(c.timeout_ns)) {
+            printf("[tensorfold] fastcomm LL: rank %d waited %.0f s for rank %d (call %u); trapping\n", c.rank,
+                   c.timeout_ns * 1e-9, r, ep);
+            __trap();
+        }
+    }
+}
+
+// Units [u] of every rank's lines at ``area(r) + u * L * 16``: all loads in flight, then the stale ones again.
+template <int L>
+__device__ __forceinline__ void gather_lines(const Ctx& c, const unsigned char* const* area, long long u, uint32_t ep,
+                                             int skip, uint4 (&v)[MAXW][2]) {
+#pragma unroll
+    for (int r = 0; r < MAXW; ++r)
+        if (r < c.world && r != skip)
+#pragma unroll
+            for (int h = 0; h < L; ++h) v[r][h] = ld_ll(area[r] + (u * L + h) * 16);
+    unsigned long long t0 = 0;
+    int spins = 0;
+    while (true) {
+        bool all = true;
+#pragma unroll
+        for (int r = 0; r < MAXW; ++r)
+            if (r < c.world && r != skip)
+#pragma unroll
+                for (int h = 0; h < L; ++h)
+                    if (v[r][h].y != ep || v[r][h].w != ep) {
+                        all = false;
+                        v[r][h] = ld_ll(area[r] + (u * L + h) * 16);
+                    }
+        if (all) return;
+        spin_timeout(c, t0, spins, 0, ep);
+    }
+}
+
+// TWO: two-shot (rank r sums slice r, publishes it, every rank copies the slices); else one-shot.
+template <typename TIn, typename TOut, bool TWO>
+__global__ void __launch_bounds__(LL_THREADS) reduce_ll_kernel(const TIn* __restrict__ in, TOut* __restrict__ out,
+                                                              Ctx c, long long n, long long sl) {
+    constexpr int LI = LL<TIn>::LINES, LO = LL<TOut>::LINES;
+    const uint32_t ep = begin(c);
+    const int par = ep & 1;
+    const long long g = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long step = static_cast<long long>(gridDim.x) * blockDim.x;
+    const unsigned char* stage[MAXW];
+    const unsigned char* red[MAXW];
+#pragma unroll
+    for (int r = 0; r < MAXW; ++r) {
+        stage[r] = c.stage + (static_cast<size_t>(par) * MAXW + r) * c.cap;
+        red[r] = c.red + (static_cast<size_t>(par) * MAXW + r) * c.rcap;
+    }
+    unsigned char* mine = const_cast<unsigned char*>(stage[c.rank]);
+    const long long units = n / U;
+    for (long long u = g; u < units; u += step) {                      // my input, as lines carrying ep
+        uint32_t w[4];
+        payload<TIn>(in, u * U, w);
+#pragma unroll
+        for (int h = 0; h < LI; ++h) st_ll(mine + (u * LI + h) * 16, w[2 * h], w[2 * h + 1], ep);
+    }
+    const long long u0 = TWO ? c.rank * sl / U : 0, u1 = TWO ? clampll((c.rank + 1) * sl, n) / U : units;
+    for (long long u = u0 + g; u < u1; u += step) {                    // sum in rank order
+        uint4 v[MAXW][2];
+        gather_lines<LI>(c, stage, u, ep, -1, v);
+        float acc[U];
+#pragma unroll
+        for (int r = 0; r < MAXW; ++r) {
+            if (r >= c.world) break;
+            uint32_t w[4] = {v[r][0].x, v[r][0].z, LI > 1 ? v[r][1].x : 0u, LI > 1 ? v[r][1].z : 0u};
+            float f[U];
+            unpack_u<TIn>(w, f);
+#pragma unroll
+            for (int i = 0; i < U; ++i) acc[i] = r == 0 ? f[i] : __fadd_rn(acc[i], f[i]);
+        }
+        uint32_t o[4];
+        pack_u<TOut>(acc, o);
+        store_u<TOut>(out, u * U, o);
+        if (TWO) {
+            unsigned char* pub = const_cast<unsigned char*>(red[c.rank]);
+#pragma unroll
+            for (int h = 0; h < LO; ++h) st_ll(pub + ((u - u0) * LO + h) * 16, o[2 * h], o[2 * h + 1], ep);
+        }
+    }
+    if (TWO) {
+        for (int r = 0; r < c.world; ++r) {                            // every other rank's published slice
+            if (r == c.rank) continue;
+            const long long a = r * sl / U, b = clampll((r + 1) * sl, n) / U;
+            const unsigned char* one[MAXW];
+#pragma unroll
+            for (int q = 0; q < MAXW; ++q) one[q] = red[r];
+            for (long long u = a + g; u < b; u += step) {
+                uint4 v[MAXW][2];
+                // only rank r's line is wanted: gather it as "every rank but the others" by pointing them all at r
+                Ctx only = c;
+                only.world = 1;
+                gather_lines<LO>(only, one, u - a, ep, -1, v);
+                uint32_t o[4] = {v[0][0].x, v[0][0].z, LO > 1 ? v[0][1].x : 0u, LO > 1 ? v[0][1].z : 0u};
+                store_u<TOut>(out, u * U, o);
+            }
+        }
+    }
+    finish(c, ep);
+}
+
+// All-gather of 4-byte words as LL lines (2 words a line).
+__global__ void __launch_bounds__(LL_THREADS) gather_ll_kernel(const uint32_t* __restrict__ in,
+                                                              uint32_t* __restrict__ out, Ctx c, long long words) {
+    const uint32_t ep = begin(c);
+    const int par = ep & 1;
+    const long long g = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long step = static_cast<long long>(gridDim.x) * blockDim.x;
+    const unsigned char* stage[MAXW];
+#pragma unroll
+    for (int r = 0; r < MAXW; ++r) stage[r] = c.stage + (static_cast<size_t>(par) * MAXW + r) * c.cap;
+    unsigned char* mine = const_cast<unsigned char*>(stage[c.rank]);
+    const long long lines = (words + 1) / 2;
+    for (long long i = g; i < lines; i += step)
+        st_ll(mine + i * 16, in[2 * i], 2 * i + 1 < words ? in[2 * i + 1] : 0u, ep);
+    for (long long i = g; i < lines; i += step) {
+        uint4 v[MAXW][2];
+        gather_lines<1>(c, stage, i, ep, -1, v);
+#pragma unroll
+        for (int r = 0; r < MAXW; ++r) {
+            if (r >= c.world) break;
+            out[r * words + 2 * i] = v[r][0].x;
+            if (2 * i + 1 < words) out[r * words + 2 * i + 1] = v[r][0].z;
+        }
+    }
+    finish(c, ep);
+}
+
 Ctx context(int64_t region, int64_t epoch, int64_t cap, int64_t rcap, int64_t rank, int64_t world, double timeout_s) {
     Ctx c;
     unsigned char* base = reinterpret_cast<unsigned char*>(region);
@@ -322,18 +523,39 @@ void fastcomm_reduce_cuda(const at::Tensor& in, at::Tensor& out, int64_t region,
                 reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "fastcomm: a multiple of 8 elements, 16-byte aligned");
     Ctx c = context(region, reinterpret_cast<int64_t>(epoch.data_ptr()), cap, rcap, rank, world, timeout_s);
     auto stream = at::cuda::getCurrentCUDAStream();
+    const bool fin = in.scalar_type() == at::kFloat, fout = out.scalar_type() == at::kFloat;
+    if (mode == 3 || mode == 4) {             // LL: lines of 16 bytes, two 4-byte payloads each
+        const bool two = mode == 4;
+        const long long sl = two ? ((n + world - 1) / world + PACK - 1) / PACK * PACK : n;
+        const long long stage_bytes = n * (fin ? 8 : 4), red_bytes = two ? sl * (fout ? 8 : 4) : 0;
+        TORCH_CHECK(stage_bytes <= cap && red_bytes <= rcap, "fastcomm LL: ", stage_bytes, " bytes past the region");
+        const long long units = n / U;
+        const int B = blocks > 0 ? static_cast<int>(std::min<int64_t>(blocks, MAXB))
+                                 : static_cast<int>(std::max<long long>(1, std::min<long long>(MAXB,
+                                                                     (units + LL_THREADS - 1) / LL_THREADS)));
+#define LLGO(TI, TO) do { if (two) reduce_ll_kernel<TI, TO, true><<<B, LL_THREADS, 0, stream>>>( \
+            reinterpret_cast<const TI*>(in.data_ptr()), reinterpret_cast<TO*>(out.data_ptr()), c, n, sl); \
+        else reduce_ll_kernel<TI, TO, false><<<B, LL_THREADS, 0, stream>>>( \
+            reinterpret_cast<const TI*>(in.data_ptr()), reinterpret_cast<TO*>(out.data_ptr()), c, n, sl); } while (0)
+        if (fin && fout) LLGO(float, float);
+        else if (fin) LLGO(float, __nv_bfloat16);
+        else if (fout) LLGO(__nv_bfloat16, float);
+        else LLGO(__nv_bfloat16, __nv_bfloat16);
+#undef LLGO
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
     const bool two = mode == 2;
     Split s;
     s.n = n;
     s.sl = two ? ((n + world - 1) / world + PACK - 1) / PACK * PACK : n;
-    const int most = blocks > 0 ? static_cast<int>(blocks) : MAXB;
-    const int B = blocks_for((two ? s.sl : n) * static_cast<long long>(in.element_size()), most < MAXB ? most : MAXB);
+    const int B = blocks > 0 ? static_cast<int>(std::min<int64_t>(blocks, MAXB))
+                             : blocks_for((two ? s.sl : n) * static_cast<long long>(in.element_size()), MAXB);
     s.cl = ((s.sl + B - 1) / B + PACK - 1) / PACK * PACK;
     TORCH_CHECK(n * in.element_size() <= cap, "fastcomm: ", n * in.element_size(), " bytes past the region's ", cap);
     TORCH_CHECK(!two || s.sl * out.element_size() <= rcap, "fastcomm: a reduced slice past the region's ", rcap);
 #define GO(K, TI, TO) K<TI, TO><<<B, THREADS, 0, stream>>>(reinterpret_cast<const TI*>(in.data_ptr()), \
                                                            reinterpret_cast<TO*>(out.data_ptr()), c, s)
-    const bool fin = in.scalar_type() == at::kFloat, fout = out.scalar_type() == at::kFloat;
     if (two) {
         if (fin && fout) GO(reduce2_kernel, float, float);
         else if (fin) GO(reduce2_kernel, float, __nv_bfloat16);
@@ -350,15 +572,24 @@ void fastcomm_reduce_cuda(const at::Tensor& in, at::Tensor& out, int64_t region,
 }
 
 void fastcomm_gather_cuda(const at::Tensor& in, at::Tensor& out, int64_t region, const at::Tensor& epoch, int64_t cap,
-                          int64_t rcap, int64_t rank, int64_t world, int64_t blocks, double timeout_s) {
+                          int64_t rcap, int64_t rank, int64_t world, int64_t blocks, double timeout_s, bool ll) {
     const long long bytes = in.numel() * in.element_size();
     const long long words = bytes / 4;
     TORCH_CHECK(in.is_cuda() && out.is_cuda() && in.is_contiguous() && out.is_contiguous() && bytes % 4 == 0 &&
                 out.numel() * out.element_size() == world * bytes, "fastcomm gather: out holds world x in");
     TORCH_CHECK(bytes <= cap, "fastcomm: ", bytes, " bytes past the region's ", cap);
     Ctx c = context(region, reinterpret_cast<int64_t>(epoch.data_ptr()), cap, rcap, rank, world, timeout_s);
-    const int most = blocks > 0 ? static_cast<int>(blocks) : MAXB;
-    const int B = blocks_for(bytes, most < MAXB ? most : MAXB);
+    if (ll && 8 * ((words + 1) / 2) * 2 <= cap) {         // LL lines: 16 bytes for every 2 words
+        const long long lines = (words + 1) / 2;
+        const int B = blocks > 0 ? static_cast<int>(std::min<int64_t>(blocks, MAXB))
+                                 : static_cast<int>(std::max<long long>(1, std::min<long long>(MAXB,
+                                                                     (lines + LL_THREADS - 1) / LL_THREADS)));
+        gather_ll_kernel<<<B, LL_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const uint32_t*>(in.data_ptr()), reinterpret_cast<uint32_t*>(out.data_ptr()), c, words);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+    const int B = blocks > 0 ? static_cast<int>(std::min<int64_t>(blocks, MAXB)) : blocks_for(bytes, MAXB);
     const long long chunk = (words + B - 1) / B;
     gather_kernel<<<B, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint32_t*>(in.data_ptr()), reinterpret_cast<uint32_t*>(out.data_ptr()), c, words, chunk);

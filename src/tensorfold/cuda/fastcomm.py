@@ -34,6 +34,9 @@ def enabled() -> bool:
     return value == "shm"
 
 
+LL_MAX = 512 << 10     # bytes of input up to which ``auto`` takes the LL forms (decode windows: 10-160 KB)
+
+
 def _round16(n: int) -> int:
     return -(-int(n) // 16) * 16
 
@@ -50,8 +53,9 @@ class FastComm:
         # a reduced slice: at most ceil(cap / 2 bytes / world) elements (bf16 in), held as fp32
         self.rcap = _round16((self.cap // 2 // self.world + 16) * 4)
         self.timeout = float(timeout if timeout is not None else os.environ.get("TF_FASTCOMM_TIMEOUT", "600"))
-        self.blocks = int(os.environ.get("TF_FASTCOMM_BLOCKS", "0"))
+        self.blocks = int(os.environ.get("TF_FASTCOMM_BLOCKS", "0"))      # 0: by size; else exactly this many
         self.shot = os.environ.get("TF_FASTCOMM_SHOT", "auto")
+        self.gather_ll = os.environ.get("TF_FASTCOMM_GATHER_LL", "1") != "0"
         ext = _ext()
         self.bytes = int(ext.region_bytes(self.cap, self.rcap))
         key = f"tf_fastcomm/{tag}"
@@ -71,11 +75,15 @@ class FastComm:
         self.name = name
         self.epoch = torch.zeros((2,), dtype=torch.int32, device="cuda")
 
-    def _mode(self, nbytes: int) -> int:
-        if self.shot in ("1", "2"):
+    def _mode(self, nbytes: int, fp32: bool) -> int:
+        """1/2: one/two-shot with flags; 3/4: one/two-shot LL (data and call number in each 8 bytes: no fence)."""
+
+        if self.shot in ("1", "2", "3", "4"):
             return int(self.shot)
-        # one-shot reads every rank's whole input; two-shot reads about twice the input but waits twice
-        return 1 if self.world <= 2 or nbytes <= 8192 else 2
+        ll = 2 * nbytes <= min(self.cap, LL_MAX)          # LL moves twice the bytes (a call number in each 8)
+        if ll:
+            return 3 if self.world <= 2 else 4
+        return 1 if self.world <= 2 else 2
 
     def reduce(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """out (fp32 or bf16) = the rank-ordered fp32 sum of every rank's x (fp32 or bf16), the same on every rank."""
@@ -84,7 +92,7 @@ class FastComm:
             out.copy_(x)
             return out
         _ext().reduce(x, out, self.region, self.epoch, self.cap, self.rcap, self.rank, self.world,
-                      self._mode(x.numel() * x.element_size()), self.blocks, self.timeout)
+                      self._mode(x.numel() * x.element_size(), x.dtype == torch.float32), self.blocks, self.timeout)
         return out
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
@@ -96,7 +104,7 @@ class FastComm:
             recv.copy_(send.reshape(-1))
             return
         _ext().gather(send, recv, self.region, self.epoch, self.cap, self.rcap, self.rank, self.world,
-                      self.blocks, self.timeout)
+                      self.blocks, self.timeout, self.gather_ll)
 
     def close(self) -> None:
         if getattr(self, "host", None):

@@ -12,7 +12,7 @@ int64_t fastcomm_region_bytes(int64_t, int64_t);
 void fastcomm_reduce_cuda(const at::Tensor&, at::Tensor&, int64_t, const at::Tensor&, int64_t, int64_t, int64_t,
                           int64_t, int64_t, int64_t, double);
 void fastcomm_gather_cuda(const at::Tensor&, at::Tensor&, int64_t, const at::Tensor&, int64_t, int64_t, int64_t,
-                          int64_t, int64_t, double);
+                          int64_t, int64_t, double, bool);
 
 // A POSIX shared-memory region mapped here and registered with the current GPU: (host address, device address).
 std::vector<int64_t> open_region(const std::string& name, int64_t bytes, bool create) {
@@ -47,11 +47,11 @@ void reduce(const at::Tensor& in, at::Tensor& out, int64_t region, const at::Ten
 }
 
 void gather(const at::Tensor& in, at::Tensor& out, int64_t region, const at::Tensor& epoch, int64_t cap, int64_t rcap,
-            int64_t rank, int64_t world, int64_t blocks, double timeout_s) {
+            int64_t rank, int64_t world, int64_t blocks, double timeout_s, bool ll) {
     TORCH_CHECK(epoch.is_cuda() && epoch.scalar_type() == at::kInt && epoch.numel() >= 2, "epoch: 2 int32 on the GPU");
     TORCH_CHECK(world >= 1 && world <= 8 && rank >= 0 && rank < world, "fastcomm: 1 to 8 ranks");
     c10::cuda::CUDAGuard guard(in.device());
-    fastcomm_gather_cuda(in, out, region, epoch, cap, rcap, rank, world, blocks, timeout_s);
+    fastcomm_gather_cuda(in, out, region, epoch, cap, rcap, rank, world, blocks, timeout_s, ll);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

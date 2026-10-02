@@ -52,7 +52,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=kv_n,
                                           nk=full.nk // world, nv=full.nv // world,
                                           moe_width=moe_hi - moe_lo, shared_width=sh_hi - sh_lo)
-    rd = _Reader(model_dir, device)
+    import os
+
+    shared = world > 1 and os.environ.get("TF_LOCAL_RANKS") == "1" and os.environ.get("TF_LOAD_DIRECT") != "1"
+    rd = _Reader(model_dir, device, shared=shared)
     prefix = "language_model." if rd.has("language_model.model.embed_tokens.weight") else ""
     # NVFP4 names the language model ``model.language_model.*``; its lm_head and mtp sit at the top level
     mbase = "model.language_model." if rd.has("model.language_model.embed_tokens.weight") else "model."
