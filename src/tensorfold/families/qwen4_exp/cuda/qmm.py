@@ -221,6 +221,30 @@ SHAPES16 = {
 }
 
 
+def _tuned(env: str, default: tuple) -> tuple:
+    """A launch shape from ``env`` ("a,b,c,..." integers; tools/tune_decode_kernels.py finds them), else ``default``."""
+
+    import os
+
+    value = os.environ.get(env, "").strip()
+    if not value:
+        return default
+    got = tuple(int(v) for v in value.split(","))
+    if len(got) != len(default) or min(got) < 1:
+        raise ValueError(f"{env}={value!r}: {len(default)} positive integers like {','.join(map(str, default))}")
+    return got
+
+
+# TF_HC_DOWN=sk,gpi,warps,stages,bn: the hyper-connection down projections' window launch (K slices change bits:
+# set it alike on every rank; one launch shape for every row count, so drafted rows stay serial ones)
+for _shape in ((324, 10240), (320, 10240)):
+    SHAPES16[_shape] = _tuned("TF_HC_DOWN", SHAPES16[_shape])
+# TF_HC_UPMIX=db,gpi,warps,stages: the up projection and mix of a window (bits unchanged by any of them)
+UPMIX = _tuned("TF_HC_UPMIX", (32, 2, 4, 3))
+if UPMIX[0] not in (32, 64):
+    raise ValueError("TF_HC_UPMIX: db is 32 or 64 (a program's dims stay inside one stored 64-row tile)")
+
+
 def split_for(n: int, k: int) -> int:
     """The K slices of an (n, k) matrix: the shape constant when there is one, else ``split_k``."""
 
@@ -407,7 +431,7 @@ def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tenso
 
     m, k = act.shape
     d = q.n // streams
-    db = 32
+    db, gpi, warps, stages = UPMIX
     grid = (triton.cdiv(m, 16), d // db)
     _qmm_upmix[grid](act, xs_act, q.weight, q.scales, q.biases, normed, mixed, xs_mixed, m, N=q.n, K=k, D=d,
-                     SS=streams, BM=16, DB=db, GPI=gpi_for(k // GS, 2), SBN=BN, num_warps=4, num_stages=3)
+                     SS=streams, BM=16, DB=db, GPI=gpi_for(k // GS, gpi), SBN=BN, num_warps=warps, num_stages=stages)

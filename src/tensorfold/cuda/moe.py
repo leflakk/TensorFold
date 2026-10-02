@@ -38,6 +38,18 @@ def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.co
     tl.store(OUT + rm[:, None] * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
 
 
+def _router16() -> tuple:
+    """TF_ROUTER=block_e,bk,stages,warps for windows of up to 16 rows (bits unchanged: K runs in order either way)."""
+
+    import os
+
+    value = os.environ.get("TF_ROUTER", "").strip()
+    return tuple(int(v) for v in value.split(",")) if value else (32, 256, 4, 4)
+
+
+ROUTER16 = _router16()
+
+
 def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """x [R, D] bf16, rows [E + 1, D] bf16 (router rows, then the shared expert's gate row) -> [R, E + 1] fp32."""
 
@@ -46,12 +58,14 @@ def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None)
     if out is None:
         out = torch.empty((m, ne), dtype=torch.float32, device=x.device)
     bm = _tile(m)
+    warps = 4
     if bm == 16:
-        be, bk, stages = 32, 256, 4
+        be, bk, stages, warps = ROUTER16
     else:
         be, bk, stages = 64, 64, 3               # Smaller K tiles keep prefill within shared-memory limits.
     grid = (triton.cdiv(m, bm), triton.cdiv(ne, be))
-    _router[grid](x, rows, out, m, x.stride(0), D=d, NE=ne, BM=bm, BLOCK_E=be, BK=bk, num_warps=4, num_stages=stages)
+    _router[grid](x, rows, out, m, x.stride(0), D=d, NE=ne, BM=bm, BLOCK_E=be, BK=bk, num_warps=warps,
+                  num_stages=stages)
     return out
 
 
