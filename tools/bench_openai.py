@@ -21,9 +21,12 @@ PROMPTS = [
 ]
 
 
-def stream(base: str, model: str, item: dict, tokens: int, temperature: float, seed: int | None) -> dict:
+def stream(base: str, model: str, item: dict, tokens: int, temperature: float, seed: int | None,
+           draft: bool = True) -> dict:
     body = {"model": model, "max_tokens": tokens, "temperature": temperature, "stream": True,
             "stream_options": {"include_usage": True}, "ignore_eos": True}
+    if not draft:
+        body["draft"] = False                     # the serial reference: one token a forward
     if seed is not None:
         body["seed"] = seed
     if temperature > 0:
@@ -69,6 +72,9 @@ def main() -> None:
     p.add_argument("--temperatures", default="1.0,0")
     p.add_argument("--label", default="")
     p.add_argument("--output")
+    p.add_argument("--no-drafts", action="store_true",
+                   help="request the serial reference (\"draft\": false): one token a forward, so 1 / tok/s is a "
+                        "forward's latency")
     p.add_argument("--seed-from-prompt", action="store_true",
                    help="send no seed: cuda_server then seeds from the prompt, as the engine benches do, "
                         "so the reply equals the bench's and the timings compare directly")
@@ -77,8 +83,9 @@ def main() -> None:
     for temp in [float(t) for t in args.temperatures.split(",")]:
         for item in PROMPTS:
             seeds = [None] * args.reps if args.seed_from_prompt else [1234 + i for i in range(args.reps)]
-            stream(args.base, args.model, item, args.tokens, temp, seeds[0])          # warm-up
-            runs = [stream(args.base, args.model, item, args.tokens, temp, seed) for seed in seeds]
+            draft = not args.no_drafts
+            stream(args.base, args.model, item, args.tokens, temp, seeds[0], draft)          # warm-up
+            runs = [stream(args.base, args.model, item, args.tokens, temp, seed, draft) for seed in seeds]
             tps = [r["decode_tps"] for r in runs if r["decode_tps"]]
             row = {"label": args.label, "prompt": item["name"], "temperature": temp, "tokens": args.tokens,
                    "decode_tps_median": statistics.median(tps), "decode_tps_all": [round(x, 2) for x in tps],
