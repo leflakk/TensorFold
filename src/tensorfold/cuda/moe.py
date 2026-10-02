@@ -48,11 +48,30 @@ def _router16() -> tuple:
 
 
 ROUTER16 = _router16()
+_DEVICE = False
+
+
+def device_defaults() -> None:
+    """Once, at the first launch: sm_86's measured router blocks (16 experts: 6.7 us against 8.5 at 4 rows)."""
+
+    global _DEVICE, ROUTER16
+    if _DEVICE:
+        return
+    _DEVICE = True
+    import os
+
+    try:
+        sm86 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 6)
+    except Exception:  # noqa: BLE001
+        sm86 = False
+    if sm86 and not os.environ.get("TF_ROUTER", "").strip():
+        ROUTER16 = (16, 256, 4, 4)
 
 
 def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """x [R, D] bf16, rows [E + 1, D] bf16 (router rows, then the shared expert's gate row) -> [R, E + 1] fp32."""
 
+    device_defaults()
     m, d = x.shape
     ne = rows.shape[0]
     if out is None:

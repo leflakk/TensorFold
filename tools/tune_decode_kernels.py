@@ -57,6 +57,7 @@ def report(title: str, results: dict, default, env: str) -> None:
 def tune_hc(results_out: list) -> None:
     from tensorfold.families.qwen4_exp.cuda import glue, qmm
 
+    qmm.device_defaults()                      # this GPU's defaults first, so the sweep's settings stay put
     down_w = qmm.make_q4(*q4_arrays(LOW + S, S * D, seed=1), "tiled")
     up_w = qmm.make_q4(*q4_arrays(S * D, LOW, seed=2), "tiled")
     scale = torch.rand((S * D,), device="cuda") + 0.5
@@ -102,6 +103,7 @@ def tune_hc(results_out: list) -> None:
 def tune_router(results_out: list) -> None:
     from tensorfold.cuda import moe
 
+    moe.device_defaults()
     rows_w = (torch.randn((E + 1, D), device="cuda") * 0.02).to(torch.bfloat16)
     found = {}
     default = moe.ROUTER16

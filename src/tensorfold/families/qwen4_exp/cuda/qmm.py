@@ -237,17 +237,40 @@ def _tuned(env: str, default: tuple) -> tuple:
 
 # TF_HC_DOWN=sk,gpi,warps,stages,bn: the hyper-connection down projections' window launch (K slices change bits:
 # set it alike on every rank; one launch shape for every row count, so drafted rows stay serial ones)
-for _shape in ((324, 10240), (320, 10240)):
+_HC_DOWN = ((324, 10240), (320, 10240))
+for _shape in _HC_DOWN:
     SHAPES16[_shape] = _tuned("TF_HC_DOWN", SHAPES16[_shape])
 # TF_HC_UPMIX=db,gpi,warps,stages: the up projection and mix of a window (bits unchanged by any of them)
 UPMIX = _tuned("TF_HC_UPMIX", (32, 2, 4, 3))
 if UPMIX[0] not in (32, 64):
     raise ValueError("TF_HC_UPMIX: db is 32 or 64 (a program's dims stay inside one stored 64-row tile)")
+_DEVICE = False
+
+
+def device_defaults() -> None:
+    """Once, at the first launch (CUDA up by then): an RTX 30 card's measured shapes where no variable names one.
+    sm_86 (8 RTX 3090s at TP 8): the HC down projection in 64 K slices of 160 inputs, a group a step, 2 warps,
+    10.8 us against 15.5 a launch at 1-7 rows."""
+
+    global _DEVICE
+    if _DEVICE:
+        return
+    _DEVICE = True
+    import os
+
+    try:
+        sm86 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 6)
+    except Exception:  # noqa: BLE001 - no driver: the portable shapes
+        sm86 = False
+    if sm86 and not os.environ.get("TF_HC_DOWN", "").strip():
+        for shape in _HC_DOWN:
+            SHAPES16[shape] = (64, 1, 2, 2, 64)
 
 
 def split_for(n: int, k: int) -> int:
     """The K slices of an (n, k) matrix: the shape constant when there is one, else ``split_k``."""
 
+    device_defaults()
     got = SHAPES16.get((n, k))
     return got[0] if got else split_k(n, k)
 

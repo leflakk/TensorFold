@@ -149,7 +149,7 @@ def run(rank: int, world: int, port: int, quick: bool, results) -> None:
             x = inputs(rank, n, torch.bfloat16, 1)
             out = torch.empty((n,), dtype=torch.bfloat16, device="cuda")
             row = {}
-            for shot in ("2", "4"):
+            for shot in MODES:
                 fc.shot = shot
                 row[f"mode{shot}"] = graph_us(lambda: fc.reduce(x, out))
             fc.shot = "auto"
