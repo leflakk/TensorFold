@@ -144,6 +144,22 @@ def run(rank: int, world: int, port: int, quick: bool, results) -> None:
                 torch.cuda.synchronize()
                 row["nccl_ar"] = eager_us(lambda: dist.all_reduce(y))
             times[f"R={rows} fp32 (graph)"] = row
+        for rows in (1, 4, 7, 16):                             # TF_DECODE_PARTIALS=bf16 (the default): half the bytes
+            n = rows * D
+            x = inputs(rank, n, torch.bfloat16, 1)
+            out = torch.empty((n,), dtype=torch.bfloat16, device="cuda")
+            row = {}
+            for shot in ("2", "4"):
+                fc.shot = shot
+                row[f"mode{shot}"] = graph_us(lambda: fc.reduce(x, out))
+            fc.shot = "auto"
+            y = x.clone()
+            try:
+                row["nccl_ar"] = graph_us(lambda: dist.all_reduce(y))
+            except Exception:                                  # noqa: BLE001
+                torch.cuda.synchronize()
+                row["nccl_ar"] = eager_us(lambda: dist.all_reduce(y))
+            times[f"R={rows} bf16 (graph)"] = row
         sweep = {}
         for rows in (4, 7, 16):                                # blocks for the LL two-shot and flag two-shot
             n = rows * D

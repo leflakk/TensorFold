@@ -36,7 +36,10 @@ def _write_norm(H, PSS, SCALE, NORMED, XS, BR, INJ, Y, WTS, RS, eps,
         hv = gl.load(H + r * (S * D) + s * D + d, valid, 0).to(gl.float32)
         if MODE != 0:
             inj = gl.load(INJ + r * S + s).to(gl.float32)
-            hv = (hv + (branch * inj).to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)
+            # glue._bround's integer rounding: bf16(branch * inj) kept apart from the add, as hc_writeback does
+            u = (branch * inj).to(gl.uint32, bitcast=True)
+            u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+            hv = (hv + u.to(gl.float32, bitcast=True)).to(gl.bfloat16).to(gl.float32)
             gl.store(H + r * (S * D) + s * D + d, hv.to(gl.bfloat16), valid)
         squares = gl.convert_layout(gl.reshape(hv * hv, (PAD // 256, 256)), partial_layout)
         partials = gl.convert_layout(gl.sum(squares, axis=1), scalars)

@@ -22,6 +22,16 @@ def _bsilu(x):
 
 
 @triton.jit
+def _bround(x):
+    """bf16(x) (round to nearest even) as fp32, in integer ops: the compiler cannot fuse the rounding into a later
+    add (on sm_86 Triton turned h + bf16(b * g) into one bf16 FMA in some kernels and not in others)."""
+
+    u = x.to(tl.uint32, bitcast=True)
+    u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+    return u.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _embed(IDS, W, S, B, OUT, D: tl.constexpr, S_COPIES: tl.constexpr):
     """Row r, group g: dequantize 32 values of token IDS[r]'s row (MLX layout), bf16, into S_COPIES streams."""
 
@@ -77,7 +87,7 @@ def _hc_writeback(H, HOUT, PSS, BR, INJ, Y, WTS, RS,
         hv = tl.load(H + r * (S * D) + s * D + d).to(tl.float32)
         if MODE != 0:
             inj = tl.load(INJ + r * S + s).to(tl.float32)
-            hv = (hv + (branch * inj).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+            hv = (hv + _bround(branch * inj)).to(tl.bfloat16).to(tl.float32)
             tl.store(HOUT + r * (S * D) + s * D + d, hv.to(tl.bfloat16))
         tl.store(PSS + (r * NC + c) * S + s, tl.sum(hv * hv, axis=0))
 

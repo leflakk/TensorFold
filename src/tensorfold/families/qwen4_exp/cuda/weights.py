@@ -30,7 +30,8 @@ def _plain(name: str, w: torch.Tensor) -> torch.Tensor:
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None) -> Weights:
+         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None,
+         table_lock: bool = False) -> Weights:
     """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids."""
 
     import time
@@ -370,7 +371,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if table_reads is not None and not ple_on_ssd:     # its pages come in while the weights load
             from tensorfold.cuda.direct_read import in_background
 
-            in_background(table.prefetch, table_reads)      # the caller waits for it (``wait_all``)
+            if table_lock and hasattr(table, "prefetch_lock"):     # read and pin each piece before weights evict it
+                in_background(lambda t=table: setattr(t, "early_locked", t.prefetch_lock()), table_reads)
+            else:
+                in_background(table.prefetch, table_reads)      # the caller waits for it (``wait_all``)
         conv = raw(name + ".conv1d.weight").reshape(cfg.streams * cfg.hidden, cfg.ple_kernel).to(torch.bfloat16)
         return PLEW(table, q4(name + ".key_proj"), q4(name + ".value_proj"),
                     cscale(name + ".norm_key.weight"), cscale(name + ".norm_query.weight"),

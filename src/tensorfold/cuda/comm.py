@@ -26,6 +26,9 @@ def _library() -> ctypes.CDLL:
         candidates.append(found)
     candidates += glob.glob("/usr/lib/*/libnccl.so.2") + glob.glob("/usr/local/lib/python3*/dist-packages/nvidia/nccl/lib/libnccl.so.2")
     candidates += glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "libnccl*.so*"))
+    # pip wheels (a venv, no Docker): nvidia/nccl/lib, or nvidia/cu13/lib in CUDA 13's layout, beside torch
+    site = os.path.dirname(os.path.dirname(torch.__file__))
+    candidates += sorted(glob.glob(os.path.join(site, "nvidia", "*", "lib", "libnccl.so*")))
     for path in candidates:
         if path:
             try:

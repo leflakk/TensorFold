@@ -10,7 +10,7 @@ from tensorfold.cuda import moe as moe_mod
 from . import attention as attn_mod
 from . import gdn as gdn_mod
 from . import kvcache
-from .tp import prefill_partials
+from .tp import decode_partials, prefill_partials
 from .weights import Weights
 
 
@@ -82,8 +82,8 @@ class Buffers:
         if world > 1:                  # tensor parallel: fp32 partials and their rank-ordered gathers
             self.part_branch = torch.empty((rows, c.hidden), dtype=f32, device=dev)
             self.part_moe = torch.empty((rows, c.hidden), dtype=f32, device=dev)
-            if self.fast:              # prompt chunks send bf16 partials (half the PCIe bytes), summed in fp32
-                p16 = prefill and prefill_partials() == "bf16"
+            if self.fast:              # bf16 partials (half the PCIe bytes), summed in fp32 in rank order
+                p16 = (prefill_partials() if prefill else decode_partials()) == "bf16"
                 self.part_branch16 = self.part_branch.to(bf) if p16 else self.part_branch
                 self.part_moe16 = self.part_moe.to(bf) if p16 else self.part_moe
                 self.red_moe = torch.empty((rows, c.hidden), dtype=bf, device=dev)

@@ -149,6 +149,28 @@ class HostTable:
 
         return _prefetch(self.words + self.scales + self.biases, workers)
 
+    def prefetch_lock(self, workers: int = 8) -> bool:
+        """Read each array and pin it (mlock) at once, before the weights' reads can evict its pages; False when
+        the memory-lock limit refuses (the rest then only prefetched, nothing left pinned)."""
+
+        import ctypes
+
+        if os.name == "nt":
+            self.prefetch(workers)
+            return self.lock()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mlock.argtypes = libc.munlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+        done, ok = [], True
+        for arr in self.words + self.scales + self.biases:
+            _prefetch([arr], workers)
+            if ok and libc.mlock(arr.ctypes.data, arr.nbytes) != 0:
+                for a, n in done:
+                    libc.munlock(a, n)
+                done, ok = [], False
+            elif ok:
+                done.append((arr.ctypes.data, arr.nbytes))
+        return ok
+
 
 class BF16Table:
     """bf16 n-gram shards (the NVFP4 checkpoint's): memory-mapped, gathered a lookup at a time as bf16 bits."""

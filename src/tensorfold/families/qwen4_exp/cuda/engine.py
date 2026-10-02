@@ -137,9 +137,20 @@ class FlashNextEngine:
         try:
             # one rank a host reads the n-gram tables ahead: the others map the same page cache
             self.table_host = prefetch and not ple_on_ssd and (rank == 0 or not getattr(self.comm, "local", False))
+            # a discrete GPU with the host's RAM to spare pins the tables while the weights load (pages read later
+            # could have been evicted by then and be read from disk again)
+            early = False
+            if self.table_host:
+                from tensorfold.cuda.capacity import _meminfo, unified
+
+                from .. import ple_bytes
+
+                memory = _meminfo()
+                early = (not unified(torch) and memory is not None
+                         and memory["MemAvailable"] - 8 * 2**30 >= ple_bytes(model_dir))
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, tp) if tp > 1 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
-                     table_reads=reads if self.table_host else None)
+                     table_reads=reads if self.table_host else None, table_lock=early)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
@@ -199,7 +210,7 @@ class FlashNextEngine:
             for table in tables.values():
                 if not tables_read:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
-                locked = room >= size and table.lock()
+                locked = getattr(table, "early_locked", False) or (room >= size and table.lock())
         read_s = time.perf_counter() - started
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         started = time.perf_counter()
@@ -242,8 +253,11 @@ class FlashNextEngine:
         from .kvcache import BITS_OF
 
         total = int(ids.sum()) if ids is not None else -1
+        from .tp import decode_partials, prefill_partials
+
+        partials = 2 * (decode_partials() == "bf16") + (prefill_partials() == "bf16")     # every rank sends alike
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
-                             len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
+                             len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype], partials,
                              int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
         world = getattr(self.comm, "world", None) or getattr(self, "tp", 2)
         every = torch.empty((world * mine.numel(),), dtype=torch.int64, device="cuda")
@@ -253,7 +267,7 @@ class FlashNextEngine:
             prompt_precision.same_on_ranks(int(every[0, -1]), int(every[r, -1]))
             if not torch.equal(every[0], every[r]):
                 raise RuntimeError(f"the ranks were started with different settings (drafts, confidence, context, "
-                                   f"draft vocabulary, KV cache): rank 0 {every[0].tolist()}, rank {r} "
+                                   f"draft vocabulary, KV cache, TF_*_PARTIALS): rank 0 {every[0].tolist()}, rank {r} "
                                    f"{every[r].tolist()}")
 
     def _key(self, n: int) -> str:

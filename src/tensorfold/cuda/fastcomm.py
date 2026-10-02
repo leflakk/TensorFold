@@ -34,9 +34,6 @@ def enabled() -> bool:
     return value == "shm"
 
 
-LL_MAX = 512 << 10     # bytes of input up to which ``auto`` takes the LL forms (decode windows: 10-160 KB)
-
-
 def _round16(n: int) -> int:
     return -(-int(n) // 16) * 16
 
@@ -80,9 +77,8 @@ class FastComm:
 
         if self.shot in ("1", "2", "3", "4"):
             return int(self.shot)
-        ll = 2 * nbytes <= min(self.cap, LL_MAX)          # LL moves twice the bytes (a call number in each 8)
-        if ll:
-            return 3 if self.world <= 2 else 4
+        # measured on 8 RTX 3090s (PCIe, no P2P), in graphs: two-shot with flags beats LL at every decode size
+        # (R=1: 19.5 us against 31.8; R=7: 70.7 against 119.7) and NCCL's all-reduce up to 16 rows
         return 1 if self.world <= 2 else 2
 
     def reduce(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

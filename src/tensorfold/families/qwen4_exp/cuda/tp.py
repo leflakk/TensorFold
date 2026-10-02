@@ -68,3 +68,16 @@ def prefill_partials() -> str:
     if value not in ("bf16", "fp32"):
         raise ValueError(f"TF_PREFILL_PARTIALS={value!r}: bf16 or fp32")
     return value
+
+
+def decode_partials() -> str:
+    """The partial sums decode windows send between ranks: bf16 (default: half the bytes of a latency-bound
+    exchange; drafted rows still equal serial ones, both taking it) or fp32 (TF_DECODE_PARTIALS=fp32: the sums
+    two ranks over NCCL give)."""
+
+    import os
+
+    value = os.environ.get("TF_DECODE_PARTIALS", "bf16").strip().lower()
+    if value not in ("bf16", "fp32"):
+        raise ValueError(f"TF_DECODE_PARTIALS={value!r}: bf16 or fp32")
+    return value

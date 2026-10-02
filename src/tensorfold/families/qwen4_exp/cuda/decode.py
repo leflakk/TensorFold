@@ -365,6 +365,50 @@ def warm(e: Engine) -> None:
     e.reset()
 
 
+class _Profile:
+    """TF_PROFILE_DECODE=N: rank 0 prints every N rounds where a round's time went (a sync at every mark)."""
+
+    @staticmethod
+    def make(w: Weights) -> "_Profile | None":
+        import os
+
+        every = int(os.environ.get("TF_PROFILE_DECODE", "0") or 0)
+        if every <= 0 or int(w.meta.get("rank", 0)) != 0:
+            return None
+        global _PROFILE
+        if _PROFILE is None:
+            _PROFILE = _Profile(every)
+        _PROFILE.last = time.perf_counter()
+        return _PROFILE
+
+    def __init__(self, every: int) -> None:
+        self.every, self.rounds = every, 0
+        self.seconds: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.last = time.perf_counter()
+
+    def mark(self, phase: str, count: int = 0) -> None:
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        self.seconds[phase] = self.seconds.get(phase, 0.0) + now - self.last
+        self.counts[phase] = self.counts.get(phase, 0) + count
+        self.last = now
+
+    def round(self) -> None:
+        self.rounds += 1
+        if self.rounds % self.every:
+            return
+        n = self.rounds
+        total = sum(self.seconds.values())
+        parts = ", ".join(f"{k} {v / n * 1e3:.2f} ms" for k, v in self.seconds.items())
+        print(f"[tensorfold] decode profile over {n} rounds: {total / n * 1e3:.2f} ms a round ({parts}); "
+              f"drafts {self.counts.get('draft', 0) / n:.2f}, verify rows {self.counts.get('verify', 0) / n:.2f}, "
+              f"kept {self.counts.get('commit', 0) / n:.2f} a round", flush=True)
+
+
+_PROFILE: _Profile | None = None
+
+
 @dataclass
 class DecodeResult:
     tokens: list[int]
@@ -422,17 +466,26 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
     start = time.perf_counter()
+    prof = _Profile.make(w)
     drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence)
+    if prof:
+        prof.mark("draft", len(drafts))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         tokens = [out[-1]] + drafts
         window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
         if window is not None:                           # the drafts no accepted path can hold are cut first
             tokens, drafts = window.tokens, window.tokens[1:]
         R = len(tokens)
+        if prof:
+            prof.mark("host")
         logits = e.forward(tokens)
+        if prof:
+            prof.mark("verify", R)
         if window is not None:
             constraint.mask(logits[:R], window, w.meta.get("vocab_offset", 0))
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling, gathered=window is None)
+        if prof:
+            prof.mark("sample")
         keep = 1
         for i, d in enumerate(drafts):
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
@@ -442,6 +495,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             n = min(keep, count - len(out))
             capture(logits[:n], sampled[:n], list(range(st.pos + 1, st.pos + 1 + n)), probabilities)
         commit(w, st, b, R, keep)
+        if prof:
+            prof.mark("commit", keep)
         unabsorbed = (keep, sampled[:keep])
         rounds += 1
         drafted += len(drafts)
@@ -459,8 +514,13 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         n = min(depth, count - len(out))
         drafts = []
         if n > 0:
+            if prof:
+                prof.mark("host")
             drafts = draft(e, b.streams[:keep], sampled[:keep], st.pos + 1, n, sampling, confidence)
             unabsorbed = None
+            if prof:
+                prof.mark("draft", len(drafts))
+                prof.round()
     torch.cuda.synchronize()
     seconds = time.perf_counter() - start
     if unabsorbed is not None:              # the MTP cache takes the last kept rows: it then covers the sequence
