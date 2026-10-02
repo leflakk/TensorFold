@@ -32,8 +32,8 @@ def test_kv_heads_follow_their_query_groups(world, want):
     got = [tp.kv_span(2, world, r) for r in range(world)]
     assert got == want
     q = 24 // world
-    for r, (kv, _) in enumerate(got):              # every local query head reads the KV head this rank holds
-        assert all(h // 12 == kv for h in range(r * q, (r + 1) * q))
+    for r, (kv, n) in enumerate(got):              # every local query head reads a KV head this rank holds
+        assert all(kv <= h // 12 < kv + n for h in range(r * q, (r + 1) * q))
 
 
 @pytest.mark.parametrize("world", [3, 16])

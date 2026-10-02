@@ -44,8 +44,8 @@ def check(cfg, world: int) -> None:
                         ("DeltaNet value heads", cfg.nv), ("vocabulary rows", cfg.vocab)):
         if value % world:
             raise ValueError(f"--tp {world}: the {value} {name} do not split over {world} GPUs")
-    kv_span(cfg.kv_heads, world, 0)
-    if cfg.heads // world > 16:
+    _, kv = kv_span(cfg.kv_heads, world, 0)
+    if cfg.heads // world // kv > 16:
         raise ValueError("the attention kernels hold at most 16 query heads a KV head on a rank")
     for name, width in (("expert", cfg.moe_width), ("shared expert", cfg.shared_width)):
         span(width, world, 0, 32)
