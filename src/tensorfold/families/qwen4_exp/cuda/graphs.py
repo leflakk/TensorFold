@@ -56,6 +56,8 @@ class Graphs:
             compute(w, segs, b, context=context)     # eager warm-up: compiles this launch shape
             g = self._capture(lambda: compute(w, segs, b, context=context))
             self.main[key] = g
+        if _kernel_profile(w, R, lambda: compute(w, segs, b, context=context), g, "verify"):
+            return b.logits[:R]
         g.replay()
         return b.logits[:R]
 
@@ -75,6 +77,8 @@ class Graphs:
             g = self._capture(lambda: mtp_compute(w, segs, b, context=context))
             self.mtp[key] = g
             self.mtp_out[key] = out
+        if _kernel_profile(w, n, lambda: mtp_compute(w, segs, b, context=context), g, "mtp"):
+            return self.mtp_out[key]
         g.replay()
         return self.mtp_out[key]
 
@@ -98,3 +102,41 @@ class Graphs:
         torch.cuda.synchronize()
         return self.captures - before
 
+
+_SEEN: dict[str, int] = {}
+
+
+def _kernel_profile(w, rows: int, eager, graph, kind: str) -> bool:
+    """TF_PROFILE_KERNELS=K: rank 0 runs its K-th window of 2+ rows (and K-th MTP step) eagerly under the torch
+    profiler and prints each kernel's GPU time (the graph's own time a round is TF_PROFILE_DECODE's). The other
+    ranks replay their graphs meanwhile: the same kernels in the same order, so the collectives still pair up (a
+    graph replayed on rank 0 alone would not). True when it ran (it computed the window)."""
+
+    import os
+
+    every = int(os.environ.get("TF_PROFILE_KERNELS", "0") or 0)
+    if every <= 0 or int(w.meta.get("rank", 0)) != 0 or (kind == "verify" and rows < 2):
+        return False
+    _SEEN[kind] = _SEEN.get(kind, 0) + 1
+    if _SEEN[kind] != every:
+        return False
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        eager()
+        torch.cuda.synchronize()
+    rows_out = []
+    for e in prof.key_averages():
+        us = next((getattr(e, a) for a in ("self_device_time_total", "self_cuda_time_total", "device_time_total",
+                                           "cuda_time_total") if getattr(e, a, 0)), 0)
+        if us:
+            rows_out.append((us, e.count, e.key))
+    rows_out.sort(reverse=True)
+    total = sum(u for u, _, _ in rows_out)
+    launches = sum(c for _, c, _ in rows_out)
+    print(f"[tensorfold] kernel profile ({kind}, {rows} rows): {launches} kernels, {total / 1e3:.2f} ms of GPU time "
+          "(eager on rank 0; collectives include waits for the other ranks)", flush=True)
+    for us, count, name in rows_out[:40]:
+        print(f"[tensorfold]   {us / 1e3:8.3f} ms {count:5d}x {us / max(count, 1):8.1f} us  {name[:110]}", flush=True)
+    return True

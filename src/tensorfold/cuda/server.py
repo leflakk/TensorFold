@@ -413,6 +413,17 @@ class App:
         gate = self._call_gate(prompt, tools) if tools and tool_choice_requires_call(body.get("tool_choice")) else None
 
         options: dict[str, Any] = {} if draft else {"draft": False}
+        if (body.get("mtp_drafts") is not None or body.get("mtp_confidence") is not None) and draft:
+            # a request's own MTP drafting (benchmark sweeps without restarts), where the engine takes it
+            if "mtp" not in inspect.signature(self.engine.generate).parameters:
+                raise RequestError("mtp_drafts / mtp_confidence: this model's CUDA engine has no per-request MTP rule")
+            try:
+                drafts = int(body["mtp_drafts"]) if body.get("mtp_drafts") is not None else int(self.engine.depth)
+                confidence = (float(body["mtp_confidence"]) if body.get("mtp_confidence") is not None
+                              else float(self.engine.confidence))
+            except (TypeError, ValueError):
+                raise RequestError("mtp_drafts takes an integer, mtp_confidence a number from 0 to 1") from None
+            options["mtp"] = (drafts, confidence)
         probabilities = None
         if body.get("logprobs"):
             from tensorfold.engine.probabilities import Probabilities
