@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 namespace {
 
@@ -144,19 +145,25 @@ __device__ __forceinline__ void store_pack<__nv_bfloat16>(void* p, const float* 
     *reinterpret_cast<uint4*>(p) = make_uint4(w[0], w[1], w[2], w[3]);
 }
 
-// PACK elements at element offset e of every rank's stage, summed in rank order (fp32)
+// PACK elements at element offset e of every rank's stage, summed in rank order (fp32). Every rank's loads are
+// issued before the first add, so the PCIe round trips overlap instead of running one rank after another.
 template <typename TIn>
 __device__ __forceinline__ void sum_pack(const Ctx& c, int par, long long e, float* acc) {
-    constexpr int V = Vec<TIn>::N;
+    constexpr int V = Vec<TIn>::N, H = PACK / V;
     const unsigned char* base = c.stage + static_cast<size_t>(par) * MAXW * c.cap + e * sizeof(TIn);
+    uint4 raw[MAXW][H];
 #pragma unroll
-    for (int i = 0; i < PACK; ++i) acc[i] = 0.0f;
-    for (int r = 0; r < c.world; ++r) {
-        const unsigned char* p = base + static_cast<size_t>(r) * c.cap;
+    for (int r = 0; r < MAXW; ++r)
+        if (r < c.world)
 #pragma unroll
-        for (int h = 0; h < PACK / V; ++h) {
+            for (int h = 0; h < H; ++h) raw[r][h] = ld_shared16(base + static_cast<size_t>(r) * c.cap + h * 16);
+#pragma unroll
+    for (int r = 0; r < MAXW; ++r) {
+        if (r >= c.world) break;
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
             float f[V];
-            widen<TIn>(ld_shared16(p + h * 16), f);
+            widen<TIn>(raw[r][h], f);
 #pragma unroll
             for (int i = 0; i < V; ++i) {
                 if (r == 0) acc[h * V + i] = f[i];               // p_0 as it is, then + p_1 + ... in order
@@ -211,15 +218,23 @@ __global__ void __launch_bounds__(THREADS) reduce2_kernel(const TIn* __restrict_
     }
     raise_flag(c, par, 1, ep);
     wait_flags(c, par, 1, ep);
-    for (int r = 0; r < c.world; ++r) {
-        if (r == c.rank) continue;
-        const long long a = clampll(r * s.sl + b * s.cl, s.n);
-        const long long e = clampll(clampll(r * s.sl + (b + 1) * s.cl, (r + 1) * s.sl), s.n);
-        if (a >= e) continue;
-        const unsigned char* red = c.red + (static_cast<size_t>(par) * MAXW + r) * c.rcap;
-        // the published slice starts at element r * sl: shift so element p sits at (p - r * sl)
-        copy_range<TOut>(reinterpret_cast<unsigned char*>(out) + static_cast<size_t>(r * s.sl) * sizeof(TOut),
-                         red, a - r * s.sl, e - r * s.sl, true);
+    {
+        // chunk b of every other rank's published slice: one load a rank in flight, then the stores
+        const long long lo = b * s.cl * static_cast<long long>(sizeof(TOut)) / 16;
+        const long long hi = clampll((b + 1) * s.cl, s.sl) * static_cast<long long>(sizeof(TOut)) / 16;
+        constexpr long long PER = 16 / sizeof(TOut);              // elements a 16-byte vector holds
+        for (long long v = lo + threadIdx.x; v < hi; v += blockDim.x) {
+            uint4 got[MAXW];
+#pragma unroll
+            for (int r = 0; r < MAXW; ++r)
+                if (r < c.world && r != c.rank && r * s.sl + v * PER < s.n)
+                    got[r] = ld_shared16(c.red + (static_cast<size_t>(par) * MAXW + r) * c.rcap + v * 16);
+#pragma unroll
+            for (int r = 0; r < MAXW; ++r)
+                if (r < c.world && r != c.rank && r * s.sl + v * PER < s.n)
+                    *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(out) +
+                                              (static_cast<size_t>(r * s.sl) + v * PER) * sizeof(TOut)) = got[r];
+        }
     }
     finish(c, ep);
 }
@@ -278,7 +293,12 @@ Ctx context(int64_t region, int64_t epoch, int64_t cap, int64_t rcap, int64_t ra
 }
 
 int blocks_for(long long bytes, int most) {
-    const long long per = 16 * 1024;                 // bytes a block moves per rank before another block helps
+    // bytes of a rank's share a block takes: small calls spread over several blocks, whose PCIe requests overlap
+    static const long long per = [] {
+        const char* v = getenv("TF_FASTCOMM_BLOCK_BYTES");
+        const long long x = v ? atoll(v) : 0;
+        return x >= 256 ? x : 2048LL;
+    }();
     long long b = (bytes + per - 1) / per;
     b = b < 1 ? 1 : b;
     return static_cast<int>(b < most ? b : most);

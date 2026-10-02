@@ -85,9 +85,10 @@ class FlashNextEngine:
                 raise ValueError(f"{tp} ranks need rank 0's address (master)")
             # ``tensorfold serve --tp N`` without --master starts every rank on this host (TF_LOCAL_RANKS=1)
             local = os.environ.get("TF_LOCAL_RANKS") == "1"
-            self.comm = NCCL(rank, tp, master, port, local=local)
+            self.comm = NCCL(rank, tp, master, port, **({"local": True} if local else {}))
             self.comm.barrier()
-        gather = (lambda values: gather_ints(torch, self.comm.all_gather, values, world=tp)) if tp > 1 else None
+        more = {} if tp == 2 else {"world": tp}                 # gather_ints defaults to two ranks
+        gather = (lambda values: gather_ints(torch, self.comm.all_gather, values, **more)) if tp > 1 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
@@ -119,13 +120,13 @@ class FlashNextEngine:
             # every partial sum and gather through shared host memory when the ranks share this host: a prompt
             # chunk's partials (bf16 or fp32), a window's fp32 ones, or gathered sampling candidates fit
             from tensorfold.cuda.geometry import PREFILL_ROWS as _ROWS
-            from .state import prefill_partials
+            from .tp import prefill_partials
 
             hidden = int(config(model_dir)["hidden_size"])
             cap = max(max(self.prefill_rows, _ROWS) * hidden * (2 if prefill_partials() == "bf16" else 4),
                       64 * hidden * 4, 8 << 20)
             self.comm.barrier()
-            if self.comm.use_fast(cap):
+            if getattr(self.comm, "use_fast", lambda cap: False)(cap):
                 print(f"[tensorfold] rank {rank} of {tp}: partial sums through shared host memory "
                       f"({self.comm.fast.bytes / 2**20:.0f} MiB region; TF_COMM=nccl uses NCCL)", flush=True)
         from concurrent.futures import wait
@@ -244,7 +245,7 @@ class FlashNextEngine:
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
                              int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
-        world = self.comm.world
+        world = getattr(self.comm, "world", None) or getattr(self, "tp", 2)
         every = torch.empty((world * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, every)
         every = every.view(world, -1).cpu()

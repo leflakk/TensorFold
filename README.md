@@ -1,3 +1,16 @@
+# TensorFold for RTX 3090 (leflakk fork, branch `rtx3090`)
+
+This branch adds RTX 30 (sm_86) support and Qwen3.8 Flash Next on 4 or 8 GPUs of one host:
+
+```bash
+tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 8 --host 0.0.0.0   # one process a GPU
+```
+
+See [docs/rtx3090.md](docs/rtx3090.md) for the format choice, the n-gram table placement, the tests to run first
+(`tools/fastcomm_check.py`) and the tuning variables. Status: experimental, under qualification on 8x RTX 3090.
+
+---
+
 # TensorFold
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
@@ -13,11 +26,11 @@ On a Mac, Homebrew installs it too: `brew install ashhart/tensorfold/tensorfold`
 Use `http://127.0.0.1:8080/v1` as the client base URL and the model ID from `/v1/models`. Both backends serve chat
 completions, completions and OpenAI's Responses API (`/v1/responses`); see the [API reference](docs/api.md).
 Python 3.11 or newer is required, and MLX 0.32.2 or newer on a Mac (pip installs it). See the [runbook](RUNBOOK.md)
-for installation and a first request. On NVIDIA GPUs the CUDA kernels need compute capability 8.9 or newer: Ada (RTX 40
+for installation and a first request. On NVIDIA GPUs the CUDA kernels need compute capability 8.6 or newer: Ampere RTX 30 (this fork), Ada (RTX 40
 series), Hopper and Blackwell, including the DGX Spark's GB10 and the RTX 50 series. NVFP4 and FP8 checkpoints run from
 8.9: their own math where the GPU has each mma (FP4 on 12.x, FP8 from 8.9), W4A16 elsewhere; the RTX 40, Hopper and
-B200 builds are compiled and bit-checked on Blackwell but not yet run on those cards. RTX 30 cards (8.6) aren't
-supported, and the server refuses a GPU below 8.9 at startup.
+B200 builds are compiled and bit-checked on Blackwell but not yet run on those cards. RTX 30 cards (8.6) run the
+MLX and EXL3 formats in bf16 math (no FP8 there); NVFP4/FP8 checkpoints and `--prefill-fp8` still need 8.9.
 
 ## Image input
 

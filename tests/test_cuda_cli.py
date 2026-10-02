@@ -27,17 +27,23 @@ def test_a_family_serves_only_the_backends_it_has():
         cli._backend("mlx", _family(cuda_engine=lambda *a, **k: None))
 
 
-def test_two_gpus_need_a_master_before_anything_loads(tmp_path):
-    called = []
+def test_ranks_without_a_master_start_on_this_host_before_anything_loads(tmp_path, monkeypatch):
+    from tensorfold.cuda import local_ranks
+
+    called, spawned = [], []
     family = _family(cuda_engine=lambda *a, **k: called.append(k))
-    args = argparse.Namespace(tp=2, rank=0, master="", master_port=29551, no_drafts=True, drafter="none",
+    monkeypatch.setattr(local_ranks, "spawn", lambda tp, argv=None: spawned.append(tp) or [])
+    args = argparse.Namespace(tp=2, rank=1, master="", master_port=29551, no_drafts=True, drafter="none",
                               mtp_drafts=None, name="", model=str(tmp_path))
-    with pytest.raises(ValueError, match="--master"):
+    with pytest.raises(ValueError, match="--rank needs --master"):
         cli._serve_cuda(args, family, tmp_path)
     args.tp, args.rank = 1, 1
-    with pytest.raises(ValueError, match="--rank 1 needs --tp 2"):
+    with pytest.raises(ValueError, match="--rank 1 needs --tp"):
         cli._serve_cuda(args, family, tmp_path)
-    assert not called
+    args.tp, args.rank = 4, 4
+    with pytest.raises(ValueError, match="ranks run 0 to 3"):
+        cli._serve_cuda(args, family, tmp_path)
+    assert not called and not spawned
 
 
 def test_serve_parses_the_cuda_flags():

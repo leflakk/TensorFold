@@ -57,3 +57,14 @@ def widths(width: int, world: int) -> list[int]:
     """Every rank's expert width (the last rank's is the narrowest)."""
 
     return [hi - lo for lo, hi in (span(width, world, r, 32) for r in range(world))]
+
+
+def prefill_partials() -> str:
+    """The partial sums prompt chunks send between ranks: bf16 (default, half the bytes) or fp32 (TF_PREFILL_PARTIALS)."""
+
+    import os
+
+    value = os.environ.get("TF_PREFILL_PARTIALS", "bf16").strip().lower()
+    if value not in ("bf16", "fp32"):
+        raise ValueError(f"TF_PREFILL_PARTIALS={value!r}: bf16 or fp32")
+    return value

@@ -10,6 +10,7 @@ from tensorfold.cuda import moe as moe_mod
 from . import attention as attn_mod
 from . import gdn as gdn_mod
 from . import kvcache
+from .tp import prefill_partials
 from .weights import Weights
 
 
@@ -17,17 +18,6 @@ from .weights import Weights
 CAND = 32      # tensor parallel: candidates a rank gathers per row for sampling (top-k 20 plus the sampler's margin 8)
 ATT_ROWS = 256  # prompt attention runs in blocks of this many rows (its partials scale with rows x context)
 ENDS = 16       # prompts one prompt pass can end (each ending prompt's last row gets the head)
-
-
-def prefill_partials() -> str:
-    """The partial sums prompt chunks send between ranks: bf16 (default, half the bytes) or fp32 (TF_PREFILL_PARTIALS)."""
-
-    import os
-
-    value = os.environ.get("TF_PREFILL_PARTIALS", "bf16").strip().lower()
-    if value not in ("bf16", "fp32"):
-        raise ValueError(f"TF_PREFILL_PARTIALS={value!r}: bf16 or fp32")
-    return value
 
 
 class Buffers:

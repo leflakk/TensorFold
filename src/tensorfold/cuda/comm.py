@@ -35,6 +35,16 @@ def _library() -> ctypes.CDLL:
     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
 
 
+BIG = 1 << 20          # bytes from which a reduce takes NCCL's all-reduce (prompt chunks), unless TF_PREFILL_COMM=shm
+
+
+def _big_comm() -> str:
+    value = os.environ.get("TF_PREFILL_COMM", "nccl").strip().lower()
+    if value not in ("nccl", "shm"):
+        raise ValueError(f"TF_PREFILL_COMM={value!r}: nccl or shm")
+    return value
+
+
 class NCCL:
     def __init__(self, rank: int, world: int, master: str, port: int, *, local: bool = False) -> None:
         from datetime import timedelta
@@ -51,6 +61,8 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        lib.ncclAllReduce.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_void_p, ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
         uid = _UniqueId()
         if rank == 0:
@@ -84,6 +96,15 @@ class NCCL:
 
         if self.fast is None:
             raise RuntimeError("reduce runs on the shared-memory collectives (TF_COMM=shm, ranks on one host)")
+        nbytes = part.numel() * part.element_size()
+        if nbytes > BIG and part.dtype == out.dtype and _big_comm() == "nccl":
+            # a prompt chunk's partials (MBs): NCCL's rings move them faster over PCIe (measured 4.7 ms against
+            # 7.0 for 10.5 MB on 8 RTX 3090s); its sum order depends on the size, so a resumed prompt can round
+            # differently from a fresh one (TF_PREFILL_COMM=shm keeps the rank-ordered sum)
+            stream = torch.cuda.current_stream().cuda_stream
+            self._check(self.lib.ncclAllReduce(part.data_ptr(), out.data_ptr(), part.numel(), _DTYPES[part.dtype],
+                                               0, self.comm, stream))
+            return out
         return self.fast.reduce(part, out)
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
