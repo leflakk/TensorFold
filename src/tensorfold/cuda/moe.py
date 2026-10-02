@@ -88,13 +88,17 @@ def _topk_rows(L, PICK, WTS, NE: tl.constexpr, NL: tl.constexpr, TOPK: tl.conste
 class MoEBuffers:
     """Static scratch for up to ``rows`` rows (CUDA-graph safe); ``prefill`` picks the experts' prefill arithmetic."""
 
-    def __init__(self, rows: int, cfg, device: torch.device | str, *, prefill: bool = False) -> None:
+    def __init__(self, rows: int, cfg, device: torch.device | str, *, prefill: bool = False, split: int = 0) -> None:
         slots = cfg.num_experts_per_tok + 1
         self.rows, self.slots = rows, slots
         self.logits = torch.empty((rows, cfg.num_experts + 1), dtype=torch.float32, device=device)
         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=device)
         self.wts = torch.empty((rows, slots), dtype=torch.float32, device=device)
         self.plan = grouped.Plan(rows, slots, cfg.num_experts + 1, device, prefill=prefill)
+        if prefill and split > 1 and rows <= grouped.TILE:      # decode windows: one pair an expert a row, 16 at most
+            self.plan.split = int(split)
+            self.plan.part = torch.empty((split * rows * slots * 2 * cfg.moe_intermediate_size,), dtype=torch.float32,
+                                         device=device)
         self.act = torch.empty((rows, slots, cfg.moe_intermediate_size), dtype=torch.bfloat16, device=device)
         self.y = torch.empty((rows, slots, cfg.hidden_size), dtype=torch.bfloat16 if prefill else torch.float32,
                              device=device)

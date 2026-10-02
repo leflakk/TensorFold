@@ -132,7 +132,9 @@ class Engine:
         self.rows, self.prefill_rows = max_rows, prefill_rows
         self.kv_dtype = kv_dtype
         self.buf = Buffers(w, max_rows, capacity, moe_prefill=True)       # the experts' arithmetic MultiDecoder's use
-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+        # tensor parallel: the MTP head's experts take the split prefill form too (drafts only: any exact arithmetic)
+        tp_form = True if w.comm is not None else None
+        self.mbuf = Buffers(w, max_rows, capacity, moe_prefill=tp_form) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
         self.st = State(w, capacity, max_rows, kv_dtype)
         self.graphs = None

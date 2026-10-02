@@ -92,6 +92,18 @@ def make(up: list[tuple], down: tuple, gs: int, *, limit: float = 0.0) -> Expert
     return Experts(u, d, gs, width, dims, float(limit))
 
 
+def decode_splits(kg: int) -> int:
+    """K splits of a decode window's SwiGLU gate/up on tensor-parallel ranks (a function of the shape: K groups):
+    8 for K = 2560 (80 groups of 32), 1 (no split) below 64 groups; TF_EXPERT_SPLITS overrides (0 or 1: none)."""
+
+    import os
+
+    value = os.environ.get("TF_EXPERT_SPLITS", "").strip()
+    if value:
+        return max(1, int(value))
+    return 8 if kg >= 64 else 1
+
+
 def max_items(pairs: int, experts: int, tile: int = TILE) -> int:
     """Items a plan of ``pairs`` can hold: an item per used expert, plus one per ``tile`` pairs past its first."""
 
@@ -105,6 +117,7 @@ class Plan:
                  prefill: bool = False) -> None:
         pairs = rows * slots
         self.rows, self.slots, self.experts, self.prefill = rows, slots, experts, prefill
+        self.split, self.part = 0, None       # K splits of the SwiGLU gate/up (decode windows), their fp32 partials
         self.tile = PREFILL_TILE if prefill else TILE     # ``route`` sets a prompt plan's to its consumer's
         self.members = torch.zeros((pairs,), dtype=torch.int32, device=device)
         self.items = torch.zeros((max_items(pairs, experts, TILE), 3), dtype=torch.int32, device=device)
@@ -120,7 +133,7 @@ def route(picks: torch.Tensor, plan: Plan, tile: int = PREFILL_TILE) -> None:
     rows, slots = picks.shape
     if slots != plan.slots or rows > plan.rows:
         raise ValueError(f"picks {tuple(picks.shape)} do not fit a plan of {plan.rows} x {plan.slots}")
-    plan.tile = tile if plan.prefill else TILE
+    plan.tile = (TILE if plan.split > 1 else tile) if plan.prefill else TILE     # split items hold 16 pairs
     _ext().plan(picks, rows * slots, plan.experts, plan.tile, plan.members, plan.items, plan.counts, plan.rank,
                 plan.hist)
 
@@ -130,6 +143,10 @@ def gate_up(x: torch.Tensor, ex: Experts, plan: Plan, out: torch.Tensor, rows: i
 
     items = max_items(rows * plan.slots, plan.experts, plan.tile)
     epi = 2 if ex.swiglu else 1
+    if plan.prefill and plan.split > 1 and ex.swiglu and ex.gs == 32:
+        _ext().prefill_split(ex.gs, x, plan.slots, ex.up, ex.dims // ex.gs, ex.width // COLS, plan.items, plan.counts,
+                             plan.members, plan.part, out, ex.width, ex.limit, items, rows * plan.slots, plan.split)
+        return
     if plan.prefill:
         _ext().prefill(ex.gs, epi, x, plan.slots, ex.up, ex.dims // ex.gs, ex.width // COLS, plan.items, plan.counts,
                        plan.members, out, ex.width, ex.limit, items)

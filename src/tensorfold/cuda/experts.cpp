@@ -10,6 +10,12 @@ void experts_prefill_cuda(int64_t gs, int64_t epi, const at::Tensor& x, int64_t 
                           const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
                           double limit, int64_t max_items);
 
+void experts_prefill_split_cuda(int64_t gs, const at::Tensor& x, int64_t x_stride, int64_t slots,
+                                const at::Tensor& w, int64_t kg, int64_t nb, const at::Tensor& items,
+                                const at::Tensor& counts, const at::Tensor& members, at::Tensor& part,
+                                at::Tensor& out, int64_t n, double limit, int64_t max_items, int64_t pairs,
+                                int64_t sk);
+
 void experts_pack_cuda(const at::Tensor& words, const at::Tensor& scales, const at::Tensor& biases, int64_t gs,
                        at::Tensor& out);
 
@@ -54,6 +60,15 @@ void prefill(int64_t gs, int64_t epi, const at::Tensor& x, int64_t slots, const 
   experts_prefill_cuda(gs, epi, x, x.stride(0), slots, w, kg, nb, items, counts, members, out, n, limit, max_items);
 }
 
+// SwiGLU gate/up of decode windows in ``sk`` K splits (fp32 partials in ``part``, summed in split order)
+void prefill_split(int64_t gs, const at::Tensor& x, int64_t slots, const at::Tensor& w, int64_t kg, int64_t nb,
+                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor part,
+                   at::Tensor out, int64_t n, double limit, int64_t max_items, int64_t pairs, int64_t sk) {
+  check_call(x, kg * gs, w, out, n, nb, 2);
+  experts_prefill_split_cuda(gs, x, x.stride(0), slots, w, kg, nb, items, counts, members, part, out, n, limit,
+                             max_items, pairs, sk);
+}
+
 // MLX words [E, N, K/8] (32-bit), scales and biases [E, N, K/gs] (2-byte) -> int32 blocks [E, N/32, K/gs, 32 * gs / 8 + 32]
 void pack(const at::Tensor& words, const at::Tensor& scales, const at::Tensor& biases, int64_t gs, at::Tensor out) {
   TORCH_CHECK(gs == 32 || gs == 64, "pack: groups of 32 or 64 inputs");
@@ -79,4 +94,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &plan, "group a layer's (row, slot) pairs by expert into items of at most tile pairs");
   m.def("run", &run, "grouped 4-bit expert matmul, decode form (epilogue 0: fp32, 1: relu^2, 2: SwiGLU)");
   m.def("prefill", &prefill, "grouped 4-bit expert matmul, prefill form (3: bf16 out)");
+  m.def("prefill_split", &prefill_split, "SwiGLU gate/up in K splits (decode windows on tensor-parallel ranks)");
 }
