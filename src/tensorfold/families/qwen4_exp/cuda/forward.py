@@ -31,6 +31,49 @@ def _gather(w: Weights, b: Buffers, part: torch.Tensor, flat: torch.Tensor, R: i
     return out.view(b.world, R, d)
 
 
+class Overlap:
+    """A prompt chunk in two halves on tensor-parallel ranks: a half's partial sums reduce on a side stream (NCCL,
+    MBs) while the other half computes. ``start`` queues a reduce once its partial is ready; ``wait`` makes the
+    compute stream wait for it before the sum is read. The halves' buffers never alias, and each partial is
+    overwritten only after its reduce was waited for, so the streams never race."""
+
+    def __init__(self, comm) -> None:
+        self.comm = comm
+        self.stream = torch.cuda.Stream()
+        self.done: dict = {}
+
+    def start(self, key, part: torch.Tensor, out: torch.Tensor) -> None:
+        ready = torch.cuda.Event()
+        ready.record()
+        self.stream.wait_event(ready)
+        with torch.cuda.stream(self.stream):
+            self.comm.reduce(part, out)
+            done = torch.cuda.Event()
+            done.record()
+        self.done[key] = done
+
+    def wait(self, key) -> None:
+        done = self.done.pop(key, None)
+        if done is not None:
+            torch.cuda.current_stream().wait_event(done)
+
+
+def _reduce(w: Weights, b: Buffers, key: str, part: torch.Tensor, out: torch.Tensor) -> None:
+    """Every rank's ``part`` summed into ``out``: now, or on the side stream while a prompt pair's other half runs."""
+
+    overlap = getattr(b, "overlap", None)
+    if overlap is None:
+        w.comm.reduce(part, out)
+    else:
+        overlap.start((id(b), key), part, out)
+
+
+def _await(b: Buffers, key: str) -> None:
+    overlap = getattr(b, "overlap", None)
+    if overlap is not None:
+        overlap.wait((id(b), key))
+
+
 def _mm(x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, out: torch.Tensor, b: Buffers, **kw) -> torch.Tensor:
     if getattr(q, "kernel", "qmm") == "b16":      # an NVFP4 checkpoint's BF16 linear (non-experts)
         return bf16.matmul(x, q, out=out)
@@ -205,7 +248,7 @@ def _out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tens
     if b.fast:                       # ranks on one host: the rank-ordered sum, rounded once to bf16 (mode 3's bits)
         part = b.part_branch16           # bf16 or fp32 by TF_PREFILL_PARTIALS / TF_DECODE_PARTIALS
         _mm(x, q, xs, part[:R], b, f32=part.dtype == torch.float32)
-        w.comm.reduce(part[:R], b.branch[:R])
+        _reduce(w, b, "branch", part[:R], b.branch[:R])
         return 1, b.branch[:R]
     _mm(x, q, xs, b.part_branch[:R], b, f32=True)
     return 3, _gather(w, b, b.part_branch, b.g_branch, R)
@@ -336,7 +379,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     if b.fast:
         part = b.part_moe16
         glue.moe_partial(buf.y[:R], buf.wts[:R], part, R)
-        w.comm.reduce(part[:R], b.red_moe[:R])
+        _reduce(w, b, "moe", part[:R], b.red_moe[:R])
         return 1, b.red_moe[:R], None
     glue.moe_partial(buf.y[:R], buf.wts[:R], b.part_moe, R)
     return 3, _gather(w, b, b.part_moe, b.g_moe, R), None
@@ -372,12 +415,15 @@ def _writeback(h: torch.Tensor, b: Buffers, R: int, c, pending) -> None:
         glue.hc_writeback(h[:R], h[:R], b.pss[:R], c.streams, mode, branch=a, inject=inj[:R])
 
 
-def _pre_moe(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int, pending, *, mtp: bool = False,
-             context: int | None = None, cuts: Sequence[Cut] = ()) -> None:
-    """A decoder layer up to its experts' input b.mixed[:R]: the n-gram branch, the mixer and both hyper-connections."""
+def _pre_mixer(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int, pending, *, mtp: bool = False,
+               context: int | None = None, cuts: Sequence[Cut] = ()) -> tuple:
+    """A decoder layer through its mixer: the n-gram branch, the attention hyper-connection and DeltaNet or attention;
+    returns the mixer's (mode, branch) for ``_post_mixer``."""
 
     c = w.cfg
     h = b.h
+    if pending is not None:
+        _await(b, "moe")                    # the previous layer's experts, summed across ranks
     if layer.ple is not None:
         if pending is not None:
             _writeback(h, b, R, c, pending)
@@ -392,10 +438,24 @@ def _pre_moe(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int,
         else:
             hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, mode, inj[:R], b.inj_a, h, branch=a)
     if layer.linear:
-        mode, branch = gdn_block(layer, w, segs, b, R, cuts)
-    else:
-        mode, branch = attn_block(layer, w, segs, b, R, mtp, context)
-    hc_block(layer.mlp_hc, b, R, c.eps, c.streams, c.low, mode, b.inj_a[:R], b.inj_m, h, branch=branch)
+        return gdn_block(layer, w, segs, b, R, cuts)
+    return attn_block(layer, w, segs, b, R, mtp, context)
+
+
+def _post_mixer(layer: LayerW, w: Weights, b: Buffers, R: int, mixed: tuple) -> None:
+    """The mixer's branch into the streams and the MLP hyper-connection: the experts' input b.mixed[:R]."""
+
+    c = w.cfg
+    mode, branch = mixed
+    _await(b, "branch")
+    hc_block(layer.mlp_hc, b, R, c.eps, c.streams, c.low, mode, b.inj_a[:R], b.inj_m, b.h, branch=branch)
+
+
+def _pre_moe(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int, pending, *, mtp: bool = False,
+             context: int | None = None, cuts: Sequence[Cut] = ()) -> None:
+    """A decoder layer up to its experts' input b.mixed[:R]: the n-gram branch, the mixer and both hyper-connections."""
+
+    _post_mixer(layer, w, b, R, _pre_mixer(layer, w, segs, b, R, pending, mtp=mtp, context=context, cuts=cuts))
 
 
 def layer_forward(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int, pending, *,
@@ -412,6 +472,8 @@ def finish(w: Weights, mixer: HC, b: Buffers, R: int, pending, logits: bool = Tr
     """The last write-back, mixer and head; a prompt pass heads only its ``ends`` rows."""
 
     c = w.cfg
+    if pending is not None:
+        _await(b, "moe")
     b.streams[:R].copy_(b.h[:R])
     _writeback(b.streams, b, R, c, pending)
     if b.prefill:
@@ -497,6 +559,33 @@ def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True,
     for layer in w.layers:
         pending = layer_forward(layer, w, segs, b, R, pending, context=context, cuts=cuts)
     return finish(w, w.mixer, b, R, pending, logits=logits, ends=ends)
+
+
+def compute_pair(w: Weights, segs_a: Sequence[Seg], ba: Buffers, segs_b: Sequence[Seg], bb: Buffers, *,
+                 logits: bool = True, ends: Sequence[int] = (), cuts_b: Sequence[Cut] = (), between=None):
+    """A prompt chunk as two halves, a's rows before b's (b continues a's sequence: its state is a view at a's end),
+    interleaved layer by layer so each half's cross-rank sums reduce (``Overlap``, set on both buffers) while the
+    other half computes. ``between`` runs after a's n-gram layer, before b's (a's rows into the n-gram conv tail).
+    Returns b's logits (``logits``: its ``ends`` rows, or its last)."""
+
+    c = w.cfg
+    ra, rb = segs_a[-1][2], segs_b[-1][2]
+    _embed(w, ba.ids[:ra], c.streams, ba.h[:ra])
+    _embed(w, bb.ids[:rb], c.streams, bb.h[:rb])
+    pa = pb = None
+    for layer in w.layers:
+        mixed_a = _pre_mixer(layer, w, segs_a, ba, ra, pa)
+        if layer.ple is not None and between is not None:
+            between()
+        mixed_b = _pre_mixer(layer, w, segs_b, bb, rb, pb, cuts=cuts_b)
+        _post_mixer(layer, w, ba, ra, mixed_a)
+        mode, y, wts = moe_block(layer, w, ba, ra)
+        pa = (mode, y, wts, ba.inj_m)
+        _post_mixer(layer, w, bb, rb, mixed_b)
+        mode, y, wts = moe_block(layer, w, bb, rb)
+        pb = (mode, y, wts, bb.inj_m)
+    finish(w, w.mixer, ba, ra, pa, logits=False)
+    return finish(w, w.mixer, bb, rb, pb, logits=logits, ends=ends)
 
 
 def converges(w: Weights) -> bool:

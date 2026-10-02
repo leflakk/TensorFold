@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 import triton
@@ -240,10 +241,20 @@ def _tuned(env: str, default: tuple) -> tuple:
 _HC_DOWN = ((324, 10240), (320, 10240))
 for _shape in _HC_DOWN:
     SHAPES16[_shape] = _tuned("TF_HC_DOWN", SHAPES16[_shape])
-# TF_HC_UPMIX=db,gpi,warps,stages: the up projection and mix of a window (bits unchanged by any of them)
-UPMIX = _tuned("TF_HC_UPMIX", (32, 2, 4, 3))
-if UPMIX[0] not in (32, 64):
-    raise ValueError("TF_HC_UPMIX: db is 32 or 64 (a program's dims stay inside one stored 64-row tile)")
+# TF_HC_UPMIX=db,gpi,warps,stages[,split]: the up projection and mix of a window (bits unchanged by any of them;
+# split 1: one program a stream, then the streams' terms added in order by a second kernel)
+def _upmix() -> tuple:
+    value = os.environ.get("TF_HC_UPMIX", "").strip()
+    if not value:
+        return (32, 2, 4, 3, 0)
+    got = tuple(int(v) for v in value.split(","))
+    got = got + (0,) * (5 - len(got)) if len(got) == 4 else got
+    if len(got) != 5 or min(got[:4]) < 1 or got[0] not in (32, 64) or got[4] not in (0, 1):
+        raise ValueError(f"TF_HC_UPMIX={value!r}: db (32 or 64),gpi,warps,stages[,split 0 or 1]")
+    return got
+
+
+UPMIX = _upmix()
 _DEVICE = False
 
 
@@ -331,6 +342,15 @@ def prefill_matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, ou
 @triton.jit
 def _bsig(x):
     return (1.0 / (1.0 + tl.exp(-x))).to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _bround(x):
+    """bf16(x) as fp32 in integer ops (round to nearest even), so the compiler cannot fold the rounding into an add."""
+
+    u = x.to(tl.uint32, bitcast=True)
+    u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+    return u.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -436,13 +456,74 @@ def _qmm_upmix(X, XS, W, S, B, NORMED, MIXED, XSM, M,
         up = acc.to(tl.bfloat16).to(tl.float32)
         nv = tl.load(NORMED + rm[:, None] * N + (st * D + j * DB + dd)[None, :], mask=m_ok[:, None],
                      other=0.0).to(tl.float32)
-        total += (_bsig(up) * nv).to(tl.bfloat16).to(tl.float32)
+        total += _bround(_bsig(up) * nv)          # the term rounded to bf16 apart from the add (no fused FMA)
     mixed = (total / SS).to(tl.bfloat16)
     tl.store(MIXED + rm[:, None] * D + (j * DB + dd)[None, :], mixed, mask=m_ok[:, None])
     GB: tl.constexpr = DB // 32
     sums = tl.sum(tl.reshape(mixed.to(tl.float32), (BM, GB, 32)), axis=2)         # each 32-dim group's sum
     gi = j * GB + tl.arange(0, GB)
     tl.store(XSM + rm[:, None] * (D // 32) + gi[None, :], sums, mask=m_ok[:, None])
+
+
+@triton.jit
+def _qmm_upterm(X, XS, W, S, B, NORMED, TERMS, M,
+                N: tl.constexpr, K: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, DB: tl.constexpr,
+                GPI: tl.constexpr, SBN: tl.constexpr):
+    """``_qmm_upmix``'s stream ``program_id(2)`` alone: its term bf16(bf16(sigmoid(bf16(up))) * normed) for dims
+    [DB j, DB (j + 1)), stored for ``_mix_terms`` to add in stream order."""
+
+    KG: tl.constexpr = K // 32
+    j = tl.program_id(1)
+    st = tl.program_id(2)
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    m_ok = rm < M
+    rk = tl.arange(0, 32)
+    rw = tl.arange(0, 4)
+    shifts = tl.arange(0, 8) * 4
+    dd = tl.arange(0, DB)
+    row0 = st * D + j * DB
+    tile = W + (row0 // SBN) * (KG * SBN * 4)
+    local = row0 % SBN + dd
+    rn = row0 + dd
+    acc = tl.zeros((BM, DB), dtype=tl.float32)
+    for i in range(KG // GPI):
+        for jj in tl.static_range(GPI):
+            g = i * GPI + jj
+            words = tl.load(tile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
+            x = tl.load(X + rm[:, None] * K + (g * 32 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            q = _deq(words, shifts, DB)
+            p = tl.dot(x, tl.trans(q))
+            s = tl.load(S + g * N + rn).to(tl.float32)
+            b = tl.load(B + g * N + rn).to(tl.float32)
+            xs = tl.load(XS + rm * KG + g, mask=m_ok, other=0.0)
+            acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
+    up = acc.to(tl.bfloat16).to(tl.float32)
+    nv = tl.load(NORMED + rm[:, None] * N + rn[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+    term = (_bsig(up) * nv).to(tl.bfloat16)
+    tl.store(TERMS + (st * M + rm[:, None]) * D + (j * DB + dd)[None, :], term, mask=m_ok[:, None])
+
+
+@triton.jit
+def _mix_terms(TERMS, MIXED, XSM, M, D: tl.constexpr, SS: tl.constexpr, BM: tl.constexpr, DB: tl.constexpr):
+    """The streams' terms added in stream order (fp32 of bf16 terms), / S, bf16: ``_qmm_upmix``'s mix, and its sums."""
+
+    j = tl.program_id(1)
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    m_ok = rm < M
+    dd = tl.arange(0, DB)
+    total = tl.zeros((BM, DB), dtype=tl.float32)
+    for st in tl.static_range(SS):
+        total += tl.load(TERMS + (st * M + rm[:, None]) * D + (j * DB + dd)[None, :], mask=m_ok[:, None],
+                         other=0.0).to(tl.float32)
+    mixed = (total / SS).to(tl.bfloat16)
+    tl.store(MIXED + rm[:, None] * D + (j * DB + dd)[None, :], mixed, mask=m_ok[:, None])
+    GB: tl.constexpr = DB // 32
+    sums = tl.sum(tl.reshape(mixed.to(tl.float32), (BM, GB, 32)), axis=2)
+    gi = j * GB + tl.arange(0, GB)
+    tl.store(XSM + rm[:, None] * (D // 32) + gi[None, :], sums, mask=m_ok[:, None])
+
+
+_TERMS: dict = {}
 
 
 def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tensor, mixed: torch.Tensor,
@@ -454,7 +535,17 @@ def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tenso
 
     m, k = act.shape
     d = q.n // streams
-    db, gpi, warps, stages = UPMIX
+    db, gpi, warps, stages, split = UPMIX
     grid = (triton.cdiv(m, 16), d // db)
+    if split:                          # a program a stream (4x the programs, a quarter of the steps), then the mix
+        key = (act.device, streams, d)
+        terms = _TERMS.get(key)
+        if terms is None or terms.numel() < streams * m * d:
+            terms = _TERMS[key] = torch.empty((streams * max(m, 16) * d,), dtype=torch.bfloat16, device=act.device)
+        _qmm_upterm[(*grid, streams)](act, xs_act, q.weight, q.scales, q.biases, normed, terms, m, N=q.n, K=k, D=d,
+                                      BM=16, DB=db, GPI=gpi_for(k // GS, gpi), SBN=BN, num_warps=warps,
+                                      num_stages=stages)
+        _mix_terms[grid](terms, mixed, xs_mixed, m, D=d, SS=streams, BM=16, DB=db, num_warps=4)
+        return
     _qmm_upmix[grid](act, xs_act, q.weight, q.scales, q.biases, normed, mixed, xs_mixed, m, N=q.n, K=k, D=d,
                      SS=streams, BM=16, DB=db, GPI=gpi_for(k // GS, gpi), SBN=BN, num_warps=warps, num_stages=stages)

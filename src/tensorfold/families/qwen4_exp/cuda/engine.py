@@ -90,11 +90,18 @@ class FlashNextEngine:
         more = {} if tp == 2 else {"world": tp}                 # gather_ints defaults to two ranks
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values, **more)) if tp > 1 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
+        # paired prompt chunks (ranks on this host) hold a second half-chunk of prompt buffers
+        import os as _os
+
+        from tensorfold.cuda.geometry import fast_partials
+
+        paired = fast_partials(tp) and _os.environ.get("TF_PREFILL_OVERLAP", "1") != "0"
+        prompt_rows = PREFILL_ROWS + (PREFILL_ROWS // 2 if paired else 0)
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
-                                               kept=KEEP_SERIAL + 1)))
+                                               kept=KEEP_SERIAL + 1, prefill_rows=prompt_rows)))
         if exl3:
             geometry = admission(geometry)
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights

@@ -256,11 +256,17 @@ void experts_prefill_split_cuda(int64_t gs, const at::Tensor& x, int64_t x_strid
 void experts_prefill_cuda(int64_t gs, int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots,
                           const at::Tensor& w, int64_t kg, int64_t nb, const at::Tensor& items,
                           const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
-                          double limit, int64_t max_items) {
+                          double limit, int64_t max_items, bool small) {
   const c10::cuda::CUDAGuard guard(x.device());
   const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
   const int b = static_cast<int>(nb), nn = static_cast<int>(n);
   const float lim = static_cast<float>(limit);
+  // ``small``: items of at most 16 pairs (decode windows' split plans): one row tile, 4 warps across 128 columns,
+  // 4 cp.async stages; every pair's arithmetic is the large tile's (one K chain in order), so the bits are its bits
+  if (small) {
+    if (gs == 32 && epi == 3) { launch_prefill<32, 1, 3, 1, 1, 4>(x, xs, sl, w, k, b, items, counts, members, out, nn, lim, max_items); return; }
+    if (gs == 32 && epi == 0) { launch_prefill<32, 1, 0, 1, 1, 4>(x, xs, sl, w, k, b, items, counts, members, out, nn, lim, max_items); return; }
+  }
   // 8 warps a CTA, 64 pairs x 128 columns: two row tiles a warp, two warps down, four across
 #define TF_PRE(GS_, M_, EPI_)                                                                                  \
   if (gs == GS_ && epi == EPI_) {                                                                              \

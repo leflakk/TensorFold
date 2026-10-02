@@ -15,7 +15,7 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import CONFIDENCE, DEPTH
-from .forward import Cut, commit, cut_snapshot, forward
+from .forward import Cut, commit, compute_pair, cut_snapshot, forward, shift_windows, stage
 from . import image_rows
 from .state import CAND, Buffers, State
 from .mtp import mtp_forward
@@ -136,6 +136,13 @@ class Engine:
         tp_form = True if w.comm is not None else None
         self.mbuf = Buffers(w, max_rows, capacity, moe_prefill=tp_form) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
+        # tensor parallel over shared memory: prompt chunks run as two halves whose sums overlap the other's compute
+        self.pbuf2 = self.overlap = None
+        if pair_prefill(w):
+            from .forward import Overlap
+
+            self.pbuf2 = Buffers(w, prefill_rows // 2, capacity, prefill=True)
+            self.overlap = Overlap(w.comm)
         self.st = State(w, capacity, max_rows, kv_dtype)
         self.graphs = None
         if graphs:
@@ -157,6 +164,7 @@ class Engine:
         other = object.__new__(Engine)
         other.w, other.capacity, other.rows, other.prefill_rows = self.w, self.capacity, self.rows, self.prefill_rows
         other.buf, other.mbuf, other.pbuf, other.graphs = self.buf, None, self.pbuf, None
+        other.pbuf2, other.overlap = self.pbuf2, self.overlap      # the serial reference prefills as drafts do
         other.st = State(self.w, self.capacity, self.rows, self.st.kv_dtype)
         return other
 
@@ -282,6 +290,85 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
     return st.pos
 
 
+PAIR_MIN = 256           # rows each half of a paired prompt chunk takes at least (smaller chunks run whole)
+
+
+def pair_prefill(w: Weights) -> bool:
+    """Whether prompt chunks run as two overlapped halves: ranks on one host summing through shared memory
+    (NCCL for MBs), unless TF_PREFILL_OVERLAP=0."""
+
+    import os
+
+    return (w.comm is not None and getattr(w.comm, "fast", None) is not None
+            and os.environ.get("TF_PREFILL_OVERLAP", "1") != "0")
+
+
+def _view(st: State, offset: int) -> State:
+    """``st`` read ``offset`` rows further on: the same caches and recurrent states, its own position."""
+
+    import copy
+
+    v = copy.copy(st)
+    v.pos = st.pos + offset
+    v.pos_dev = torch.full((1,), st.pos + offset, dtype=torch.int32, device=st.pos_dev.device)
+    return v
+
+
+def _prefill_pair(e: Engine, prompt: Sequence[int], start: int, end: int, point: int, mtp: bool):
+    """``prefill_chunk``'s work as two halves (``compute_pair``); ``point`` lies in the second half or is 0."""
+
+    w, st, ba, bb = e.w, e.st, e.pbuf, e.pbuf2
+    chunk = list(prompt[start:end])
+    R = len(chunk)
+    final = end == len(prompt)
+    ra = (R + 1) // 2
+    rb = R - ra
+    first, second = chunk[:ra], chunk[ra:]
+    before = st.ple_history
+    segs_a = stage(w, ba, [(st, first)])
+    sb = _view(st, ra)
+    if before is not None:                       # the second half's n-grams continue the first's tokens
+        sb.ple_history = np.concatenate([before, np.asarray(first, dtype=np.int64)])[-(w.cfg.ngram_size - 1):]
+    segs_b = stage(w, bb, [(sb, second)])
+    cut = Cut(point - ra) if 0 < point - ra < rb else None
+    tail = st.ple_tail
+
+    def between() -> None:                       # the first half's n-gram rows into the conv tail the second reads
+        shift_windows(tail[None], ba.ple_nrow[None, :ra], ra, tail.shape[1])
+
+    ba.overlap = bb.overlap = e.overlap
+    try:
+        logits = compute_pair(w, segs_a, ba, segs_b, bb, logits=final, cuts_b=() if cut is None else (cut,),
+                              between=between if before is not None else None)
+    finally:
+        ba.overlap = bb.overlap = None
+    last = logits.clone() if final else None
+    e.last_streams = bb.streams[rb - 1:rb].clone()
+    use_mtp = _absorbs(e, mtp)
+    snap = kept_tail = None
+    mtp_len = st.mtp_len
+    if point:                    # before the MTP head writes the streams: the point's tail, its state inside the chunk
+        mtp_len = st.mtp_len + point - 1 if use_mtp else st.mtp_len
+        kept_tail = bb.streams[point - ra - 1:point - ra].clone() if use_mtp else None
+        snap = cut_snapshot(w, sb, bb, cut, mtp_len) if cut is not None else None
+    nxt = list(prompt[start + 1:end + 1])
+    if use_mtp and nxt:
+        na = min(ra, len(nxt))
+        mtp_forward(w, st, ba, nxt[:na], ba.streams[:na])
+        st.set_mtp_len(st.mtp_len + na)
+        if len(nxt) > na:
+            mtp_forward(w, st, bb, nxt[na:], bb.streams[:len(nxt) - na])
+            st.set_mtp_len(st.mtp_len + len(nxt) - na)
+    # commit: the first half (its n-gram tail moved already, its DeltaNet layers committed in the forward), then the
+    # second half as one chunk from the first's end
+    st.ple_history, st.ple_last = sb.ple_history, sb.ple_last
+    st.set_pos(st.pos + ra)
+    commit(w, st, bb, rb, rb)
+    if point:
+        e.kept = {"state": snap if snap is not None else {**st.snapshot(), "mtp_len": mtp_len}, "tail": kept_tail}
+    return last
+
+
 @torch.no_grad()
 def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = True,
                   keep_at: int | None = None, end: int | None = None) -> torch.Tensor | None:
@@ -293,6 +380,9 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = T
     R = len(chunk)
     final = end == len(prompt)
     point = keep_at - start if keep_at is not None and start < keep_at <= end else 0     # the kept point's row
+    if (getattr(e, "pbuf2", None) is not None and R // 2 >= PAIR_MIN and st.image_positions is None
+            and not 0 < point <= (R + 1) // 2):
+        return _prefill_pair(e, prompt, start, end, point, mtp)
     cut = Cut(point) if 0 < point < R else None           # inside the chunk, not at its end
     # only the prompt's last row is sampled: the head runs on the final chunk alone
     logits = forward(w, st, pb, chunk, logits=final, cut=cut)

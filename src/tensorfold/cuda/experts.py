@@ -149,7 +149,7 @@ def gate_up(x: torch.Tensor, ex: Experts, plan: Plan, out: torch.Tensor, rows: i
         return
     if plan.prefill:
         _ext().prefill(ex.gs, epi, x, plan.slots, ex.up, ex.dims // ex.gs, ex.width // COLS, plan.items, plan.counts,
-                       plan.members, out, ex.width, ex.limit, items)
+                       plan.members, out, ex.width, ex.limit, items, False)
     else:
         _ext().run(ex.gs, epi, x, plan.slots, ex.up, ex.dims // ex.gs, ex.width // COLS, plan.items, plan.counts,
                    plan.members, out, ex.width, ex.limit, items * (ex.width // COLS))
@@ -160,8 +160,10 @@ def down(act: torch.Tensor, ex: Experts, plan: Plan, out: torch.Tensor, rows: in
 
     items = max_items(rows * plan.slots, plan.experts, plan.tile)
     if plan.prefill:
+        # a split plan's items hold 16 pairs at most: the one-tile kernel (the same bits, a quarter of the CTA)
+        small = plan.split > 1 and plan.tile <= TILE and ex.gs == 32
         _ext().prefill(ex.gs, 3 if out.dtype == torch.bfloat16 else 0, act, 0, ex.down, ex.width // ex.gs,
-                       ex.dims // COLS, plan.items, plan.counts, plan.members, out, ex.dims, 0.0, items)
+                       ex.dims // COLS, plan.items, plan.counts, plan.members, out, ex.dims, 0.0, items, small)
     else:
         _ext().run(ex.gs, 0, act, 0, ex.down, ex.width // ex.gs, ex.dims // COLS, plan.items, plan.counts,
                    plan.members, out, ex.dims, 0.0, items * (ex.dims // COLS))

@@ -4,7 +4,8 @@
 
 Each launch is captured 50 times in a CUDA graph (as decode runs it) and the replay timed. Kernels:
 - hyper-connection down projection [324, 10240] (TF_HC_DOWN=sk,gpi,warps,stages,bn; sk changes bits),
-- hyper-connection up projection + mix [10240, 320] (TF_HC_UPMIX=db,gpi,warps,stages; db 32 or 64),
+- hyper-connection up projection + mix [10240, 320] (TF_HC_UPMIX=db,gpi,warps,stages,split; db 32 or 64; split 1:
+  a program a stream, then the mix),
 - router [513, 2560] bf16 (TF_ROUTER=block_e,bk,stages,warps),
 - routed + shared experts' SwiGLU gate/up at widths 96 and 64 (TF_EXPERT_SPLITS=n; 1: the unsplit kernel),
   and the down projection for reference.
@@ -87,10 +88,10 @@ def tune_hc(results_out: list) -> None:
         mixed = torch.empty((rows, D), dtype=torch.bfloat16, device="cuda")
         xs_mixed = torch.empty((rows, D // 32), dtype=torch.float32, device="cuda")
         ups[rows] = {}
-        for db, gpi, warps, stages in itertools.product((32, 64), (1, 2, 5), (2, 4, 8), (2, 3, 4)):   # db <= a 64-row tile
-            qmm.UPMIX = (db, gpi, warps, stages)
+        for db, gpi, warps, stages, split in itertools.product((32, 64), (1, 2, 5), (2, 4, 8), (2, 3, 4), (0, 1)):
+            qmm.UPMIX = (db, gpi, warps, stages, split)               # db <= a 64-row tile; split: a program a stream
             try:
-                ups[rows][(db, gpi, warps, stages)] = graph_us(
+                ups[rows][(db, gpi, warps, stages, split)] = graph_us(
                     lambda: qmm.hc_upmix(act, xs_act, up_w, normed, mixed, xs_mixed, S))
             except Exception:                              # noqa: BLE001
                 torch.cuda.synchronize()
@@ -148,11 +149,12 @@ def tune_experts(results_out: list) -> None:
                 grouped.route(buf.pick[:rows], buf.plan)
                 act = buf.act.view(-1, width)
                 found[rows][sk] = graph_us(lambda: grouped.gate_up(x, ex, buf.plan, act, rows))
-                if sk == 8:
-                    downs[rows] = graph_us(lambda: grouped.down(act, ex, buf.plan, buf.y.view(-1, D), rows))
+                if sk in (1, 8):          # 1: 64-pair tiles (prompt plans); 8: decode plans' 16-pair tiles
+                    downs[(rows, sk)] = graph_us(lambda: grouped.down(act, ex, buf.plan, buf.y.view(-1, D), rows))
         report(f"experts gate/up width {width}", found, 8, "TF_EXPERT_SPLITS")
-        for rows, us in downs.items():
-            print(f"{'experts down width ' + str(width):28} R={rows:<2} {us:7.1f} us (reference)", flush=True)
+        for (rows, sk), us in sorted(downs.items()):
+            tiles = "64-pair tiles (before)" if sk == 1 else "16-pair tiles (decode plans now)"
+            print(f"{'experts down width ' + str(width):28} R={rows:<2} {us:7.1f} us  {tiles}", flush=True)
         results_out.append((f"experts{width}", found))
         del ex
         torch.cuda.empty_cache()

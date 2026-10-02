@@ -8,7 +8,7 @@ void experts_run_cuda(int64_t gs, int64_t epi, const at::Tensor& x, int64_t x_st
 void experts_prefill_cuda(int64_t gs, int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots,
                           const at::Tensor& w, int64_t kg, int64_t nb, const at::Tensor& items,
                           const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
-                          double limit, int64_t max_items);
+                          double limit, int64_t max_items, bool small);
 
 void experts_prefill_split_cuda(int64_t gs, const at::Tensor& x, int64_t x_stride, int64_t slots,
                                 const at::Tensor& w, int64_t kg, int64_t nb, const at::Tensor& items,
@@ -55,9 +55,10 @@ void run(int64_t gs, int64_t epi, const at::Tensor& x, int64_t slots, const at::
 
 void prefill(int64_t gs, int64_t epi, const at::Tensor& x, int64_t slots, const at::Tensor& w, int64_t kg,
              int64_t nb, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor out,
-             int64_t n, double limit, int64_t max_items) {
+             int64_t n, double limit, int64_t max_items, bool small) {
   check_call(x, kg * gs, w, out, n, nb, epi);
-  experts_prefill_cuda(gs, epi, x, x.stride(0), slots, w, kg, nb, items, counts, members, out, n, limit, max_items);
+  experts_prefill_cuda(gs, epi, x, x.stride(0), slots, w, kg, nb, items, counts, members, out, n, limit, max_items,
+                       small);
 }
 
 // SwiGLU gate/up of decode windows in ``sk`` K splits (fp32 partials in ``part``, summed in split order)
