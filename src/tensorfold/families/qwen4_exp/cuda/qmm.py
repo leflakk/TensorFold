@@ -530,7 +530,7 @@ _TERMS: dict = {}
 
 
 def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tensor, mixed: torch.Tensor,
-             xs_mixed: torch.Tensor, streams: int) -> None:
+             xs_mixed: torch.Tensor, streams: int, *, scratch: dict | None = None) -> None:
     """The up projection and the stream mix in one kernel, 32 dims of every stream a program: the bits of ``matmul`` then ``glue.hc_mix``."""
 
     if q.layout != "tiled":
@@ -542,10 +542,12 @@ def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tenso
     db, gpi, warps, stages, split = UPMIX
     grid = (triton.cdiv(m, 16), d // db)
     if split:                          # a program a stream (4x the programs, a quarter of the steps), then the mix
+        # the streams' terms: the caller's own scratch (a rank's buffers: thread ranks must not share one)
+        held = _TERMS if scratch is None else scratch
         key = (act.device, streams, d)
-        terms = _TERMS.get(key)
+        terms = held.get(key)
         if terms is None or terms.numel() < streams * m * d:
-            terms = _TERMS[key] = torch.empty((streams * max(m, 16) * d,), dtype=torch.bfloat16, device=act.device)
+            terms = held[key] = torch.empty((streams * max(m, 16) * d,), dtype=torch.bfloat16, device=act.device)
         _qmm_upterm[(*grid, streams)](act, xs_act, q.weight, q.scales, q.biases, normed, terms, m, N=q.n, K=k, D=d,
                                       BM=16, DB=db, GPI=gpi_for(k // GS, gpi), SBN=BN, num_warps=warps,
                                       num_stages=stages)

@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 BLOCK = 1024
-BIG = 1 << 30
+BIG = tl.constexpr(1 << 30)          # a constexpr global: compiled Triton refuses plain module globals
 
 
 @triton.jit
@@ -75,25 +75,24 @@ def _merge_top(VALS, IDS, MAXS, SUMS, NB, OUT, MAP, offset, K: tl.constexpr, NBP
     tl.store(OUT + r * width + 2 * K, lse)
 
 
-_SCRATCH: dict = {}
-
-
 def candidates(logits: torch.Tensor, out: torch.Tensor, k: int, *, offset: int = 0,
-               id_map: torch.Tensor | None = None) -> torch.Tensor:
+               id_map: torch.Tensor | None = None, scratch: dict | None = None) -> torch.Tensor:
     """logits [R, n] (bf16 or fp32) -> out [R, 2k + 1] fp32: each row's top k logits, their global ids (fp32 bits),
-    the row's log-sum-exp."""
+    the row's log-sum-exp. ``scratch``: the caller's own dict for the blocks' partials (one a rank: ranks that are
+    threads of one process must not share it)."""
 
     rows, n = logits.shape
     nb = triton.cdiv(n, BLOCK)
     key = (logits.device, rows, nb, k)
-    scratch = _SCRATCH.get(key)
-    if scratch is None:
+    scratch = {} if scratch is None else scratch
+    got = scratch.get(key)
+    if got is None:
         dev = logits.device
-        scratch = _SCRATCH[key] = (torch.empty((rows * nb * k,), dtype=torch.float32, device=dev),
+        got = scratch[key] = (torch.empty((rows * nb * k,), dtype=torch.float32, device=dev),
                                    torch.empty((rows * nb * k,), dtype=torch.int32, device=dev),
                                    torch.empty((rows * nb,), dtype=torch.float32, device=dev),
                                    torch.empty((rows * nb,), dtype=torch.float32, device=dev))
-    vals, ids, maxs, sums = scratch
+    vals, ids, maxs, sums = got
     _block_top[(rows, nb)](logits, logits.stride(0), n, vals, ids, maxs, sums, nb, K=k, BLOCK=BLOCK, num_warps=4)
     _merge_top[(rows,)](vals, ids, maxs, sums, nb, out, id_map if id_map is not None else ids, int(offset), K=k,
                         NBP=triton.next_power_of_2(nb), HAS_MAP=id_map is not None, num_warps=4)

@@ -141,7 +141,8 @@ def _readout_fused(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, stre
         glue.hc_reduce_act(got, b.act[:R], b.xs_act[:R], inject, streams, low)
     else:
         glue.hc_act(got, b.act[:R], b.xs_act[:R], inject, streams, low)
-    qmm.hc_upmix(b.act[:R], b.xs_act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams)
+    qmm.hc_upmix(b.act[:R], b.xs_act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams,
+                 scratch=b.__dict__.setdefault("hc_scratch", {}))
 
 
 def _readout_plain(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject,
@@ -509,7 +510,7 @@ def candidates(w: Weights, b: Buffers, logits: torch.Tensor, R: int, *, id_map: 
     if _TOPK_KERNEL:             # two Triton passes (topk.py): 59 us -> a few on the draft head, lowest id among equals
         from .topk import candidates as top
 
-        top(logits, c, CAND, offset=offset, id_map=id_map)
+        top(logits, c, CAND, offset=offset, id_map=id_map, scratch=b.__dict__.setdefault("topk_scratch", {}))
     else:
         lf = logits.float()
         vals, idx = torch.topk(lf, CAND, dim=-1, sorted=False)
