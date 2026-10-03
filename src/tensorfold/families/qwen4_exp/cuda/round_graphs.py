@@ -48,7 +48,7 @@ class RoundGraphs:
         self.dec, self.capture = dec, bool(capture)
         self.width = dec.depth + 1                       # W: the most rows a stream's own window holds
         self.bound = self.width + STEP - 1               # ... and with the round's padding after them
-        self.pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle() if torch.cuda.is_available() else None
         self.graphs: dict[tuple, torch.cuda.CUDAGraph] = {}
         self.outs: dict[tuple, torch.Tensor] = {}
         self.statics: dict[tuple, StaticTables] = {}
@@ -90,6 +90,30 @@ class RoundGraphs:
         """The keys a captured step's attention covers: a power of two from 8192, at most the window."""
 
         return min(self.dec.capacity, max(8192, 1 << max(0, int(end) - 1).bit_length()))
+
+    def tables(self, segs, held) -> tuple:
+        """A captured round's DeltaNet tables and attention step for ``segs`` (``held``: each stream's rows to fold),
+        in the static buffers of its shape (streams, rows): the warm-up's capture and every later round of that shape
+        read the same buffers, refilled here."""
+
+        from . import attn_multi, gdn_multi
+
+        d = self.dec
+        n, R = len(segs), segs[-1][2]
+        tables = gdn_multi.Tables(d.w, d.gdn, segs, held, static=self.static(("gdn", n, R)), width=self.width,
+                                  folds=True)
+        step = attn_multi.Step(d.w, segs, mtp=False, static=self.static(("attn", n, R)), most=self.bound,
+                               context=self.bucket(max(st.pos + a1 - a0 for st, a0, a1 in segs)))
+        return tables, step
+
+    def mtp_step(self, segs):
+        """A captured MTP step's attention step for ``segs``, in the static buffers of its shape (streams, rows)."""
+
+        from . import attn_multi
+
+        n, R = len(segs), segs[-1][2]
+        return attn_multi.Step(self.dec.w, segs, mtp=True, static=self.static(("mtp", n, R)), most=self.bound,
+                               context=self.bucket(max(st.mtp_len + a1 - a0 for st, a0, a1 in segs)))
 
     def _capture(self, fn) -> torch.cuda.CUDAGraph:
         torch.cuda.synchronize()
@@ -170,13 +194,11 @@ class RoundGraphs:
 
         if not self.capture:
             return
-        from . import attn_multi, gdn_multi
         from .forward import stage
         from .mtp import mtp_stage
 
         d = self.dec
         w = d.w
-        context = self.bucket(1)
         saved_parity = d.gdn.parity
         try:
             for n in range(1, len(states) + 1):
@@ -185,10 +207,7 @@ class RoundGraphs:
                     for parity in (0, 1):
                         d.gdn.parity = parity
                         segs = stage(w, d.buf, _split(states[:n], R))
-                        tables = gdn_multi.Tables(w, d.gdn, segs, [[] for _ in segs],
-                                                  static=self.static(("gdn", n)), width=self.width, folds=True)
-                        step = attn_multi.Step(w, segs, mtp=False, static=self.static(("attn", n)), context=context,
-                                               most=self.bound)
+                        tables, step = self.tables(segs, [[] for _ in segs])
                         d.buf.gdn_tables, d.buf.attn_step = tables, step
                         try:
                             self.verify(segs, tables, step)
@@ -202,9 +221,7 @@ class RoundGraphs:
                         windows.append((st, tokens, d.mbuf.mtp_in[a0:a0 + len(tokens)]))
                         a0 += len(tokens)
                     segs = mtp_stage(w, d.mbuf, windows)
-                    step = attn_multi.Step(w, segs, mtp=True, static=self.static(("mtp", n, R)), context=context,
-                                           most=self.bound)
-                    d.mbuf.attn_step = step
+                    step = d.mbuf.attn_step = self.mtp_step(segs)
                     try:
                         self.mtp(segs, step)
                     finally:

@@ -528,11 +528,7 @@ class MultiDecoder:
         held = [self.held.pop(s.sid, []) for s in live]
         graphed = self.rounds is not None and not pieces and all(st.image_positions is None for st, _, _ in segs)
         if graphed:                                      # this shape's device tables, refilled
-            n, R, rg = len(segs), segs[-1][2], self.rounds
-            tables = gdn_multi.Tables(self.w, self.gdn, segs, held, static=rg.static(("gdn", n, R)),
-                                      width=rg.width, folds=True)
-            step = attn_multi.Step(self.w, segs, mtp=False, static=rg.static(("attn", n, R)),
-                                   context=rg.bucket(max(a1 - a0 + st.pos for st, a0, a1 in segs)), most=rg.bound)
+            tables, step = self.rounds.tables(segs, held)
         else:
             tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
             step = attn_multi.Step(self.w, segs, mtp=False)
@@ -713,10 +709,7 @@ class MultiDecoder:
         if self.rounds is None:
             self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
         else:
-            rows, rg = segs[-1][2], self.rounds
-            self.mbuf.attn_step = attn_multi.Step(
-                self.w, segs, mtp=True, static=rg.static(("mtp", len(segs), rows)),
-                context=rg.bucket(max(st.mtp_len + a1 - a0 for st, a0, a1 in segs)), most=rg.bound)
+            self.mbuf.attn_step = self.rounds.mtp_step(segs)
         try:
             if self.rounds is not None:
                 return self.rounds.mtp(segs, self.mbuf.attn_step)
