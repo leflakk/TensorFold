@@ -253,6 +253,7 @@ class FlashNextEngine:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
                 locked = getattr(table, "early_locked", False) or (room >= size and table.lock())
         read_s = time.perf_counter() - started
+        free = torch.cuda.mem_get_info()[0]           # what the graphs and the warm-up's buffers take, from here
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         started = time.perf_counter()
         if self.concurrent:
@@ -267,6 +268,7 @@ class FlashNextEngine:
             self.vision.warm()
             torch.cuda.empty_cache()
         warm_s = time.perf_counter() - started
+        warm_gib = (free - torch.cuda.mem_get_info()[0]) / 2**30
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.served = 0
@@ -289,7 +291,7 @@ class FlashNextEngine:
         kv = "" if self.kv_dtype == "bf16" else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)"
         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
-              f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
+              f"prompt kernels warmed in {warm_s:.1f}s (graphs and warm-up: {warm_gib:.2f} GiB)", flush=True)
 
     def _same_settings(self, torch, ids) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
