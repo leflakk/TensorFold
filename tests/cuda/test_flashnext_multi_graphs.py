@@ -1,9 +1,10 @@
 """Flash Next's concurrent rounds as CUDA graphs (``round_graphs``), on one GPU.
 
-A round's rows go up to a multiple of 4 (padding after the last stream's own), each (stream count, rows) verify
-forward and MTP step is captured once and replayed with each round's tables: every stream still emits its solo run
-(dense and sparse attention, quantized caches, an n-gram layer, caches that grow or move), as eager rounds do. The
-warm-up captures every shape; the one-launch kernels the rounds read by table give each row its stream's own bits.
+One stream's round holds its own rows, more streams' go up to a multiple of 2 (padding after the last stream's own);
+each (stream count, rows) verify forward and MTP step is captured once and replayed with each round's tables: every
+stream still emits its solo run (dense and sparse attention, quantized caches, an n-gram layer, caches that grow or
+move), as eager rounds do. The warm-up captures every shape; the one-launch kernels the rounds read by table give
+each row its stream's own bits.
 """
 
 import tempfile
@@ -70,7 +71,7 @@ def test_rounds_in_graphs_equal_each_alone(apart, graphs, kv_dtype):
         kinds = {key[:2] for key in dec.rounds.graphs}
         assert any(k[0] == "verify" for k in kinds) and any(k[0] == "mtp" for k in kinds), kinds
         assert {k[1] for k in kinds if k[0] == "verify"} >= {1, 4}         # the first round alone, four streams
-        assert all(key[2] % 4 == 0 or key[2] == key[1] * 4 for key in dec.rounds.graphs)   # rows: 4s, n windows
+        assert all(dec.rounds.rows(key[1], key[2]) == key[2] for key in dec.rounds.graphs)   # rows: its shape's
     assert len(dec.free) + len({id(k[1]) for k in dec.kept}) == 4 and not dec.live()
 
 

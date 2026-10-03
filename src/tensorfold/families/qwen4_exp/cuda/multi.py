@@ -531,7 +531,7 @@ class MultiDecoder:
             prof.since("outside", self.drafted_at)       # the scheduler, the ring and the replies since last round
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
-        # captured rounds: the round's rows to a multiple of 4, padding after the last stream's own
+        # captured rounds: the round's rows to its shape's (``RoundGraphs.rows``), padding after the last stream's own
         segs = stage(self.w, self.buf, windows if self.rounds is None else self.rounds.pad(windows))
         ranges = [(a0, a0 + len(tokens)) for (_, a0, _), (_, tokens) in zip(segs, windows)]   # each stream's rows
         # a pass shares the round's forward only where their experts share a launch; else _fill ran it between rounds
@@ -643,7 +643,7 @@ class MultiDecoder:
             windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
             segs = mtp_stage(self.w, self.mbuf, windows)
             lasts = [a1 - 1 for _, _, a1 in segs]
-        else:                                            # a captured step: its rows to a multiple of 4
+        else:                                            # a captured step: its rows to its shape's
             segs, lasts = self._mtp_stage([(s.st, keep, self.buf.streams[a0:a0 + len(keep)])
                                            for s, a0, keep in todo])
         logits = self._mtp(segs)

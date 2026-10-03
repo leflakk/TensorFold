@@ -2,8 +2,8 @@
 
 A graph captured on the warm-up's synthetic window of a shape (streams, rows) replays any later round of that
 shape: both must build their tables in the same static buffers, of the same sizes, whichever way the rows split
-between the streams. A round's rows go up to a multiple of 4 by padding after the last stream's own rows, no
-further than its cache holds.
+between the streams. One stream's round holds its own rows; more streams' go up to a multiple of 2 (up to four
+streams, then 4) by padding after the last stream's own rows, no further than its cache holds.
 """
 
 from types import SimpleNamespace
@@ -75,21 +75,25 @@ def test_every_shape_the_warm_up_captures_is_the_buffers_its_rounds_refill(decod
                 assert ("mtp", n, R) in rg.statics
 
 
-def test_a_rounds_rows_go_to_a_multiple_of_4_after_the_last_streams_own(decoder):
+def test_a_rounds_rows_go_to_its_shapes_after_the_last_streams_own(decoder):
     rg, W = decoder.rounds, DEPTH + 1
+    assert [rg.rows(1, own) for own in range(1, W + 1)] == list(range(1, W + 1))       # one stream: as alone
+    assert [rg.rows(5, own) for own in (5, 6, 9, 33, 35)] == [8, 8, 12, 35, 35]         # past four: a multiple of 4
     a, b = decoder.states[:2]
     a.set_pos(10), b.set_pos(10)
-    for counts in ([3, 2], [7, 7], [1, 1], [6, 3]):
+    for k in (1, 4, 7):
+        assert rg.pad([(a, list(range(k)))]) == [(a, list(range(k)))]
+    for counts in ([3, 2], [7, 7], [1, 1], [6, 3], [2, 2]):
         windows = [(a, list(range(counts[0]))), (b, list(range(100, 100 + counts[1])))]
         padded = rg.pad(windows)
         own, rows = sum(counts), sum(len(t) for _, t in padded)
-        assert rows == min(2 * W, -(-own // 4) * 4) and rows >= own, counts
+        assert rows == min(2 * W, -(-own // 2) * 2) and rows >= own, counts
         assert padded[0][1] == windows[0][1] and padded[1][1][:counts[1]] == windows[1][1]
         assert set(padded[1][1][counts[1]:]) <= {windows[1][1][-1]}          # the last own token again
     tight = State(decoder.w, 16, W, limit=16)
-    tight.set_pos(12)
-    padded = rg.pad([(a, [1, 2, 3]), (tight, [4, 5])])       # 5 rows -> 8, but its cache holds 2 rows past them
-    assert [len(t) for _, t in padded] == [3, 4]
+    tight.set_pos(14)
+    padded = rg.pad([(a, [1, 2, 3]), (tight, [4, 5])])       # 5 rows -> 6, but its cache holds none past them
+    assert [len(t) for _, t in padded] == [3, 2]
     a.set_pos(0), b.set_pos(0)
 
 
@@ -130,7 +134,7 @@ def test_the_warm_up_walks_every_shape_once_a_parity_and_empties_its_slots(monke
     shapes = {n: sorted({rg.rows(n, own) for own in range(n, n * W + 1)}) for n in range(1, SLOTS + 1)}
     verify = [c for c in calls if c[0] == "verify"]
     assert sorted(c[1:4] for c in verify) == sorted((n, R, p) for n in shapes for R in shapes[n] for p in (0, 1))
-    assert len(verify) == 2 * 19 and all(c[4] for c in verify)          # 19 shapes at --parallel 4, 6 drafts
+    assert len(verify) == 2 * 37 and all(c[4] for c in verify)          # 37 shapes at --parallel 4, 6 drafts
     steps = [c for c in calls if c[0] == "mtp"]
     assert sorted(c[1:3] for c in steps) == sorted((n, R) for n in shapes for R in set(shapes[n]) | {rg.rows(n, n)})
     assert all(c[3] for c in steps)
@@ -149,8 +153,41 @@ def test_a_captured_mtp_steps_rows_are_written_in_place_and_padded_with_the_last
     source = torch.arange(10 * wide, dtype=torch.float32).view(10, wide)
     windows = [(dec.states[0], [5, 6, 7], source[0:3]), (dec.states[1], [8, 9], source[5:7])]
     segs, lasts = MultiDecoder._mtp_stage(dec, windows)
-    assert [(a0, a1) for _, a0, a1 in segs] == [(0, 3), (3, 8)]          # 5 own rows -> 8
+    assert [(a0, a1) for _, a0, a1 in segs] == [(0, 3), (3, 6)]          # 5 own rows -> 6
     assert lasts == [2, 4]                                              # each stream's last own row
     assert torch.equal(dec.mbuf.mtp_in[:5], torch.cat([source[0:3], source[5:7]]))
-    assert torch.equal(dec.mbuf.mtp_in[5:8], source[6:7].expand(3, -1))  # the last own row again
-    assert dec.mbuf.ids_host[:8].tolist() == [5, 6, 7, 8, 9, 9, 9, 9] and dec.mbuf.last_host[:2].tolist() == [2, 4]
+    assert torch.equal(dec.mbuf.mtp_in[5:6], source[6:7])                # the last own row again
+    assert dec.mbuf.ids_host[:6].tolist() == [5, 6, 7, 8, 9, 9] and dec.mbuf.last_host[:2].tolist() == [2, 4]
+    alone = [(dec.states[2], [4], source[8:9])]                          # one stream's chain step: its one row
+    segs, lasts = MultiDecoder._mtp_stage(dec, alone)
+    assert [(a0, a1) for _, a0, a1 in segs] == [(0, 1)] and lasts == [0]
+
+
+def test_past_its_limit_the_least_recently_replayed_shape_goes(monkeypatch):
+    """Captures and replays stubbed on the CPU: a shape replayed since its capture outlives older-replayed ones."""
+
+    from contextlib import nullcontext
+
+    dec = _decoder()
+    rg = dec.rounds
+    rg.limit, replayed = 3, []
+
+    class Graph:
+        def replay(self):
+            replayed.append(self)
+
+    monkeypatch.setattr(round_graphs, "compute", lambda w, segs, b: None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda g, **k: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    dec.buf = SimpleNamespace(logits=torch.zeros((32, 4)))
+
+    def run(rows):
+        segs = _segs(dec.states[:1], [rows])
+        rg.verify(segs, SimpleNamespace(cur=0, folds=False), SimpleNamespace(context=8192))
+        return ("verify", 1, rows, 0, False, 8192)
+
+    a, b, c = run(1), run(2), run(3)
+    run(1)                                               # a replayed: now the most recent
+    d = run(4)                                           # past the limit: b goes, not a
+    assert list(rg.graphs) == [c, a, d] and rg.captures == 4 and len(replayed) == 5

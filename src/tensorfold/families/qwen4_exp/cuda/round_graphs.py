@@ -1,11 +1,12 @@
 """Concurrent rounds as CUDA graphs: the verify forward of n streams, and the MTP head's steps.
 
-A round's window holds n streams' own rows (each stream its token and drafts), the total rounded up to a multiple
-of STEP by rows after the last stream's own (padding comes after a stream's rows in its chain, so its rows keep
-their bits; their outputs are dropped). Its shape is then n, its rows, the DeltaNet scratch parity and the context
-bucket that bounds the attention launches; last round's rows always fold in (none for a new stream). The tables it
-reads (rows' streams and positions, cache, state and n-gram tail pointers, the rows to fold) live in static device
-buffers refilled before each replay, so one graph serves any n streams holding those rows.
+A round's window holds n streams' own rows (each stream its token and drafts): one stream's alone, more streams'
+rounded up to a multiple of 2 (up to FINE streams) or STEP by rows after the last stream's own (padding comes after
+a stream's rows in its chain, so its rows keep their bits; their outputs are dropped). Its shape is then n, its
+rows, the DeltaNet scratch parity and the context bucket that bounds the attention launches; last round's rows
+always fold in (none for a new stream). The tables it reads (rows' streams and positions, cache, state and n-gram
+tail pointers, the rows to fold) live in static device buffers refilled before each replay, so one graph serves any
+n streams holding those rows.
 
 ``warm`` captures every shape of the 8,192-key bucket before a request, on idle slots (a graph does not depend on
 which streams it reads); a longer context's bucket is captured on its first round, after an eager run of that round
@@ -26,7 +27,8 @@ from .graphs import _kernel_profile
 from .mtp import mtp_compute
 from .static_tables import StaticTables
 
-STEP = 4                 # a round's rows are a multiple of this (fewer shapes; at most STEP - 1 padding rows)
+STEP = 4                 # past FINE streams, a round's rows are a multiple of this (at most STEP - 1 padding rows)
+FINE = 4                 # up to this many streams, a multiple of 2 (one stream: its own rows)
 
 
 def enabled(tp: bool) -> bool:
@@ -41,8 +43,9 @@ def enabled(tp: bool) -> bool:
 
 class RoundGraphs:
     """A concurrent decoder's captured verify forwards and MTP steps, by shape; at most ``TF_MULTI_GRAPHS_MAX``
-    (default 160) graphs, the oldest dropped past it. ``capture=False``: the same rows and static tables, run eager
-    (ranks that are threads of one process, whose collectives sync the host, cannot be captured)."""
+    (default 256: two context buckets of --parallel 4's 111 shapes) graphs, the least recently replayed dropped past
+    it. ``capture=False``: the same rows and static tables, run eager (ranks that are threads of one process, whose
+    collectives sync the host, cannot be captured)."""
 
     def __init__(self, dec, *, capture: bool = True) -> None:
         self.dec, self.capture = dec, bool(capture)
@@ -53,7 +56,7 @@ class RoundGraphs:
         self.outs: dict[tuple, torch.Tensor] = {}
         self.statics: dict[tuple, StaticTables] = {}
         self.captures = self.replays = 0
-        self.limit = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "160"))
+        self.limit = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "256"))
         # the up projection's per-stream terms, sized for the widest window now: a graph holds their address, so a
         # later, wider window must not reallocate them (``qmm.hc_upmix`` grows its scratch on demand)
         c = dec.w.cfg
@@ -64,10 +67,13 @@ class RoundGraphs:
                     (c.streams * max(b.rows, 16) * c.hidden,), dtype=torch.bfloat16, device=dev)
 
     def rows(self, n: int, own: int) -> int:
-        """The rows of a window of ``n`` streams holding ``own`` rows of their own: the next multiple of STEP, at
-        most n windows of W."""
+        """The rows of a window of ``n`` streams holding ``own`` rows of their own: one stream's own rows, more
+        streams' the next multiple of 2 (up to FINE streams) or STEP, at most n windows of W. A padding row costs
+        about what an own row does (0.5-0.75 ms a verify row on 8 RTX 3090s); a shape costs a graph a context
+        bucket."""
 
-        return max(own, min(n * self.width, -(-own // STEP) * STEP))
+        step = 1 if n == 1 else 2 if n <= FINE else STEP
+        return max(own, min(n * self.width, -(-own // step) * step))
 
     def pad(self, windows: list) -> list:
         """``windows`` [(state, tokens)] with the last stream's tokens repeated after its own up to the round's rows
@@ -129,7 +135,7 @@ class RoundGraphs:
                 gc.enable()
         torch.cuda.synchronize()
         self.captures += 1
-        while len(self.graphs) >= self.limit:    # the oldest shape goes (captured again if it comes back)
+        while len(self.graphs) >= self.limit:    # the least recently replayed goes (captured again if it comes back)
             old = next(iter(self.graphs))
             del self.graphs[old]
             self.outs.pop(old, None)
@@ -158,6 +164,8 @@ class RoundGraphs:
             del saved
             g = self._capture(lambda: compute(w, segs, b))
             self.graphs[key] = g
+        else:
+            self.graphs[key] = self.graphs.pop(key)       # the most recently replayed last (dropped last)
         # TF_PROFILE_KERNELS=K: rank 0 runs its K-th round of each stream count eagerly under the profiler (the other
         # ranks replay the same kernels in the same order, so the collectives pair up)
         if _kernel_profile(w, R, lambda: compute(w, segs, b), g, f"concurrent verify, {len(segs)} streams"):
@@ -180,6 +188,8 @@ class RoundGraphs:
             g = self._capture(lambda: mtp_compute(w, segs, b, pick=True))
             self.graphs[key] = g
             self.outs[key] = out
+        else:
+            self.graphs[key] = self.graphs.pop(key)
         if _kernel_profile(w, segs[-1][2], lambda: mtp_compute(w, segs, b, pick=True), g,
                            f"concurrent MTP step, {len(segs)} streams"):
             return self.outs[key]
