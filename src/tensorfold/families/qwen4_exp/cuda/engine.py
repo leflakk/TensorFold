@@ -29,10 +29,29 @@ def vision_workspace() -> int:
     return int(value) * 2**20
 
 
+def _cuts_text(cuts: tuple[float, ...]) -> str:
+    """'70%', or '50%/60%/70% for rounds of 1/2/3+ streams'."""
+
+    if len(cuts) == 1:
+        return f"{cuts[0]:.0%}"
+    counts = "/".join(map(str, range(1, len(cuts))))
+    return f"{'/'.join(f'{c:.0%}' for c in cuts)} for rounds of {counts}/{len(cuts)}+ streams"
+
+
+def _cuts_key(cuts: tuple[float, ...]) -> int:
+    """The draft cuts as one number the ranks compare: one cut's millionths, or (negative) a checksum of several."""
+
+    if len(cuts) == 1:
+        return round(cuts[0] * 1e6)
+    import zlib
+
+    return -1 - zlib.crc32(",".join(f"{c:.6f}" for c in cuts).encode())
+
+
 class FlashNextEngine:
     """``eos``, ``generate`` (rank 0 or one GPU) and ``follow`` (rank 1), as ``tensorfold.cuda.server`` expects."""
 
-    def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
+    def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float | tuple[float, ...] = CONFIDENCE,
                  draft_vocab: str | int | None = "default", max_len: int | None = None,
                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
@@ -71,10 +90,13 @@ class FlashNextEngine:
                              f"{streams}` without --master")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
-        if not 0.0 <= float(confidence) <= 1.0:
+        # one cut, or --parallel's by the streams a round verifies (the n-th for n streams, the last for more)
+        cuts = tuple(map(float, confidence)) if isinstance(confidence, (tuple, list)) else (float(confidence),)
+        if not cuts or not all(0.0 <= c <= 1.0 for c in cuts):
             raise ValueError(f"MTP draft confidence: a probability from 0 to 1, not {confidence}")
         torch.cuda.set_device(0)
-        self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
+        self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), cuts[0]
+        self.cuts = cuts
         self.streams = int(streams)
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
@@ -197,7 +219,7 @@ class FlashNextEngine:
 
             self.e = None
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                      confidence=self.confidence, keep=KEEP, points=self.points,
+                                      confidence=self.cuts, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace)
             decoder = self.multi
@@ -251,7 +273,7 @@ class FlashNextEngine:
         self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
         self.serial = None                                # the serial requests' engine, made on first use
         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
-                f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
+                f"{_cuts_text(self.cuts)}" if self.depth else "no drafts: the serial reference, one token a round")
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), "
@@ -278,7 +300,7 @@ class FlashNextEngine:
         from .tp import decode_partials, prefill_partials
 
         partials = 2 * (decode_partials() == "bf16") + (prefill_partials() == "bf16")     # every rank sends alike
-        mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
+        mine = torch.tensor([self.depth, _cuts_key(getattr(self, "cuts", (self.confidence,))), self.max_len,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype], partials,
                              int(getattr(self, "streams", 1)), int(prompt_precision.fp8())], dtype=torch.int64,
                             device="cuda")

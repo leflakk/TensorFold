@@ -177,7 +177,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
               "docs/recipes/qwen3.8-flash-next.md#exl3-checkpoints-experimental for how they compare", flush=True)
     if drafter:
         raise ValueError(f"{TITLE} drafts with its own MTP head on CUDA: a separate draft model does not apply")
-    from .cuda import CONFIDENCE, DEPTH, TP_CONFIDENCE
+    from .cuda import CONFIDENCE, DEPTH, TP_CONFIDENCE, TP_STREAM_CONFIDENCE, stream_confidence
     from .cuda.engine import FlashNextEngine
 
     if kv_dtype not in CUDA_KV_DTYPES:       # refuse an unknown cache before any weight is read (no torch import)
@@ -187,12 +187,18 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         raise ValueError(f"this checkpoint has no MTP head, which {TITLE}'s CUDA engine drafts with ({MODELS[0]} "
                          "has one): without it every round would decode one token. Serve a checkpoint with the "
                          "head, or pass --no-drafts for the serial reference")
+    streams = max(1, int(options.get("parallel") or 1))
     # 8 RTX 3090s (TP 8): a 0.3 cut decoded as fast or faster than 0.7 in all four bench cells (a verify window's
-    # extra rows cost little next to its fixed launches and collectives)
-    confidence = (TP_CONFIDENCE if int(tp) > 1 else CONFIDENCE) if mtp_confidence is None else float(mtp_confidence)
+    # extra rows cost little next to its fixed launches and collectives); --parallel: a cut by the round's streams
+    if mtp_confidence is not None:
+        confidence = float(mtp_confidence)
+    elif streams > 1:
+        confidence = stream_confidence(TP_STREAM_CONFIDENCE if int(tp) > 1 else (CONFIDENCE,))
+    else:
+        confidence = TP_CONFIDENCE if int(tp) > 1 else CONFIDENCE
     return FlashNextEngine(Path(model_dir), depth=depth, confidence=confidence, max_len=context,
                            context_explicit=options.get("context_explicit"), tp=int(tp), rank=int(rank),
-                           master=master, port=int(master_port), streams=max(1, int(options.get("parallel") or 1)),
+                           master=master, port=int(master_port), streams=streams,
                            ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype,
                            share=0.0 if decode_share is None else float(decode_share),
                            vision=bool(options.get("vision", False)),

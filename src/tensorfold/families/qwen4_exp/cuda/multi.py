@@ -73,14 +73,20 @@ class MultiDecoder:
     planned: int | None = None                       # tensor parallel: the pass rows rank 0 chose for this round
     clock = False                                    # rank 0 of tensor-parallel ranks: times passes alone (share)
 
-    def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
+    def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH,
+                 confidence: float | tuple[float, ...] = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0,
                  graphs: bool | str | None = None) -> None:
         self.tp = w.comm is not None
         if self.tp and vision is not None:
             raise ValueError("image input on Flash Next runs on one GPU")
-        self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
+        self.w, self.depth, self.capacity = w, depth, capacity
+        # where a draft chain stops: one cut, or one by the streams of the round that verifies the drafts (the n-th
+        # for n streams, the last for more: a round's rows wait for each other, so a doubtful draft is worth less
+        # the more streams share it); every rank counts the same streams
+        self.cuts = tuple(map(float, confidence)) if isinstance(confidence, (tuple, list)) else (float(confidence),)
+        self.confidence = self.cuts[0]
         self.points = points                         # a prompt's message starts to keep states at, or None
         self.vision = vision
         self.eos = tuple(w.cfg.eos) if stop_eos else ()
@@ -109,6 +115,7 @@ class MultiDecoder:
         self.rounds = (round_graphs.RoundGraphs(self, capture=graphs != "pad")
                        if use and capturable and torch.cuda.is_available() else None)
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
+        self.drafted_at: float | None = None             # TF_PROFILE_DECODE: when the last round's drafts were made
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
@@ -354,7 +361,9 @@ class MultiDecoder:
             torch.cuda.synchronize()
             per = (time.perf_counter() - t0) / rows
             self.row_s = per if self.row_s is None else 0.7 * self.row_s + 0.3 * per
-        return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces))
+        staying = sum(1 for s in self.streams.values() if not s.done and not s.waiting)
+        return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces),
+                            self._cut(staying, pieces))
 
     def _pass_pair(self, piece) -> tuple:
         """A pass of one prompt piece through the one-stream engine's ``prefill_chunk`` (two overlapped halves when
@@ -441,8 +450,16 @@ class MultiDecoder:
             self._drop_kept(s.st)
         return failed                                    # finish() frees their slots
 
-    def _joined(self, pieces, heads, lasts, spent: float) -> list[Stream]:
-        """Prompts that ended sample their first token, draft and join the rounds; returns those already done."""
+    def _cut(self, staying: int, pieces=()) -> float:
+        """The cut for drafts the next round verifies: ``staying`` streams go on into it, with the prompts that end
+        in ``pieces``."""
+
+        n = staying + sum(1 for s, a, k in pieces if a + k == len(s.prompt))
+        return self.cuts[min(max(n, 1), len(self.cuts)) - 1]
+
+    def _joined(self, pieces, heads, lasts, spent: float, cut: float) -> list[Stream]:
+        """Prompts that ended sample their first token, draft (``cut``: where a chain stops) and join the rounds;
+        returns those already done."""
 
         joined, head = [], 0
         for (s, a, n), last in zip(pieces, lasts):
@@ -469,7 +486,7 @@ class MultiDecoder:
             image_rows.finish(st)
             s.context = list(s.prompt)
             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
-                             self.confidence) if mtp and s.count > 1 else []
+                             cut) if mtp and s.count > 1 else []
             s.started = time.perf_counter()
             self.streams[s.sid] = s
             s.take([first], self._ends(s))
@@ -491,6 +508,7 @@ class MultiDecoder:
         if self.filling and (not live or not self.converged):
             ended += self._fill()                      # passes alone; a prompt that ends here joins this round
             live = [s for s in self.streams.values() if not s.done and not s.waiting]
+            self.drafted_at = None                     # (the time since the last round is a pass's, not overhead)
         if not live:
             return ended
         grammars, failed = {}, []
@@ -508,7 +526,9 @@ class MultiDecoder:
         live = [s for s in live if not s.done]
         if not live:
             return failed + ended
-        prof = _Profile.make(self.w)                     # TF_PROFILE_DECODE=N: where rounds' time goes (rank 0)
+        prof = _Profile.make(self.w, len(live))          # TF_PROFILE_DECODE=N: where rounds' time goes (rank 0)
+        if prof:
+            prof.since("outside", self.drafted_at)       # the scheduler, the ring and the replies since last round
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
         # captured rounds: the round's rows to a multiple of 4, padding after the last stream's own
@@ -584,10 +604,12 @@ class MultiDecoder:
             kept.append((s, a0, rows[:len(path)], new, last))
         if prof:
             prof.mark("commit", sum(len(path) for path, _ in paths))
-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
+        cut = self._cut(sum(1 for *_, last in kept if not last), pieces)      # by the next round's streams
+        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last], cut)
         if prof:
             prof.mark("draft", sum(len(s.drafts) for s, _, _, _, last in kept if s.draft and not last))
             prof.round()
+            self.drafted_at = None if pieces else time.perf_counter()
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -596,14 +618,15 @@ class MultiDecoder:
         spent = time.perf_counter() - t0
         self._timed(spent, sum(n for _, _, n in pieces))
         if pieces:                                     # prompts that ended in this round's pass join the next
-            ended += self._joined(pieces, heads, lasts, spent / len(pieces))
+            ended += self._joined(pieces, heads, lasts, spent / len(pieces), cut)
         done = [s for s in live if s.done]
         for s in done:                                   # a finished stream's state is never read again
             self.held.pop(s.sid, None)
         return failed + done + ended
 
-    def _draft_all(self, streams: list) -> None:
-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+    def _draft_all(self, streams: list, cut: float) -> None:
+        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth; a chain
+        stops before a later draft under ``cut``."""
 
         for s, _, _ in streams:
             s.drafts = []
@@ -631,7 +654,7 @@ class MultiDecoder:
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
-                low = self.confidence > 0 and p < self.confidence
+                low = cut > 0 and p < cut
                 if low and j > 0:
                     continue
                 s.drafts.append(d)

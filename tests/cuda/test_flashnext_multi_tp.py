@@ -177,8 +177,9 @@ def test_rank_zero_serves_and_the_others_replay_its_calls(checkpoint):
     refs = _threads(hub, [lambda w=w: _solo(w, prompts, samplings) for w in ws])
     assert all(ref == refs[0] for ref in refs)
     ring = _Queues(WORLD)
-    decoders = [MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, prefill_rows=16, graphs="pad")
-                for w in ws]
+    # a cut by the streams of the next round (1, 2, 3): every rank counts the same ones as streams join and leave
+    decoders = [MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=(0.3, 0.6, 0.9), prefill_rows=16,
+                             graphs="pad") for w in ws]
     replies: dict[int, list[int]] = {}
 
     def serve():

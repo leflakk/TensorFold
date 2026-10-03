@@ -473,23 +473,25 @@ def warm(e: Engine) -> None:
 
 
 class _Profile:
-    """TF_PROFILE_DECODE=N: rank 0 prints every N rounds where a round's time went (a sync at every mark)."""
+    """TF_PROFILE_DECODE=N: rank 0 prints, every N rounds, where those rounds' time went (a sync at every mark);
+    concurrent rounds by their stream count, with the time since the round before (``outside``: the scheduler,
+    the ring to the other ranks, the replies)."""
 
     @staticmethod
-    def make(w: Weights) -> "_Profile | None":
+    def make(w: Weights, streams: int | None = None) -> "_Profile | None":
         import os
 
         every = int(os.environ.get("TF_PROFILE_DECODE", "0") or 0)
         if every <= 0 or int(w.meta.get("rank", 0)) != 0:
             return None
-        global _PROFILE
-        if _PROFILE is None:
-            _PROFILE = _Profile(every)
-        _PROFILE.last = time.perf_counter()
-        return _PROFILE
+        prof = _PROFILES.get(streams)
+        if prof is None:
+            prof = _PROFILES[streams] = _Profile(every, streams)
+        prof.last = time.perf_counter()
+        return prof
 
-    def __init__(self, every: int) -> None:
-        self.every, self.rounds = every, 0
+    def __init__(self, every: int, streams: int | None = None) -> None:
+        self.every, self.streams, self.rounds = every, streams, 0
         self.seconds: dict[str, float] = {}
         self.counts: dict[str, int] = {}
         self.last = time.perf_counter()
@@ -500,6 +502,12 @@ class _Profile:
         self.seconds[phase] = self.seconds.get(phase, 0.0) + now - self.last
         self.counts[phase] = self.counts.get(phase, 0) + count
         self.last = now
+
+    def since(self, phase: str, then: float | None) -> None:
+        """The time from ``then`` (None: not counted) to this round's start, as ``phase``."""
+
+        if then is not None:
+            self.seconds[phase] = self.seconds.get(phase, 0.0) + self.last - then
 
     def count(self, name: str, n: int) -> None:
         self.counts[name] = self.counts.get(name, 0) + n
@@ -512,12 +520,14 @@ class _Profile:
         total = sum(self.seconds.values())
         parts = ", ".join(f"{k} {v / n * 1e3:.2f} ms" for k, v in self.seconds.items())
         streams = f"streams {self.counts['streams'] / n:.2f}, " if "streams" in self.counts else ""
-        print(f"[tensorfold] decode profile over {n} rounds: {total / n * 1e3:.2f} ms a round ({parts}); "
+        label = "" if self.streams is None else f" ({self.streams} stream{'s' if self.streams > 1 else ''})"
+        print(f"[tensorfold] decode profile{label} over {n} rounds: {total / n * 1e3:.2f} ms a round ({parts}); "
               f"{streams}drafts {self.counts.get('draft', 0) / n:.2f}, verify rows "
               f"{self.counts.get('verify', 0) / n:.2f}, kept {self.counts.get('commit', 0) / n:.2f} a round", flush=True)
+        self.rounds, self.seconds, self.counts = 0, {}, {}       # each print: the last N rounds
 
 
-_PROFILE: _Profile | None = None
+_PROFILES: dict[int | None, _Profile] = {}          # by stream count (None: the one-stream engine)
 
 
 @dataclass

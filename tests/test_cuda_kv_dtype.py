@@ -140,7 +140,7 @@ def test_two_ranks_with_different_prompt_precision_refuse_to_start(fake_runtime)
         rank(Comm(theirs.sent))._same_settings(torch, None)
 
 
-@pytest.mark.parametrize("confidence", [-0.1, 1.5])
+@pytest.mark.parametrize("confidence", [-0.1, 1.5, (0.5, 1.5)])
 def test_a_draft_confidence_outside_0_to_1_is_refused_before_loading(tmp_path, fake_runtime, confidence):  # noqa: F811
     checkpoint(tmp_path, small_config(), WEIGHTS)
     calls, _ = fake_runtime
