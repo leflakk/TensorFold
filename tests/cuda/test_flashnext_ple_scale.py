@@ -28,7 +28,11 @@ def test_table_scale_follows_dequantization_and_updates_group_sums(value, packed
         glue.ple_embed_bf16(rows, values, heads, dims, out, sums, scale=factor)
     expected = (plain.float() * factor).to(torch.bfloat16)
     assert torch.equal(out, expected)
-    assert torch.equal(sums, expected.float().reshape(rows, -1, 32).sum(-1))
+    # the kernel sums each group of 32 in its own fixed order (every path takes it); torch's fp32 sum may take
+    # another and land an ulp away (on sm_86, one group of 60 here): the sums are checked against the exact ones,
+    # within fp32 summation's bound in any order
+    groups = expected.double().reshape(rows, -1, 32)
+    assert torch.all((sums.double() - groups.sum(-1)).abs() <= 32 * 2**-24 * groups.abs().sum(-1))
     if factor == 1:
         assert torch.equal(out, plain) and torch.equal(sums, plain_sums)
 
