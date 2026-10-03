@@ -105,10 +105,12 @@ class Step:
     """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move.
 
     ``static``: the device tables a captured step reads (``StaticTables``, one a window shape), refilled here;
-    ``context``: the keys launches cover (a captured step's bucket; default the longest stream's end). The main
-    model's step also lists each stream's n-gram tail (``tails``) for the window's one n-gram launch."""
+    ``context``: the keys launches cover (a captured step's bucket; default the longest stream's end); ``most``: the
+    most rows a stream holds (a captured step's bound; default this step's). The main model's step also lists each
+    stream's n-gram tail (``tails``) for the window's one n-gram launch."""
 
-    def __init__(self, w, segs: Sequence, mtp: bool, *, static=None, context: int | None = None) -> None:
+    def __init__(self, w, segs: Sequence, mtp: bool, *, static=None, context: int | None = None,
+                 most: int | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         layers = [l for l in w.layers if not l.linear] if not mtp else [w.mtp.layer]
         self.index = {layer.index: i for i, layer in enumerate(layers)}
@@ -145,7 +147,7 @@ class Step:
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
         self.context = max(self.ends) if context is None else int(context)
-        self.most = max(counts)
+        self.most = max(counts) if most is None else int(most)
         self.vision = any(st.image_positions is not None for st, _, _ in segs)
         self.vision_ptrs = self.ptrs[0]
         if self.vision:

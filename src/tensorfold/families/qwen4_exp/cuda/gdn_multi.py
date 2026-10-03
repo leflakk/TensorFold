@@ -30,10 +30,11 @@ class Scratch:
 class Tables:
     """A round's device tables: rows' streams and conv taps, layers' conv and state pointers, chains, pending rows.
     ``static``: a captured round's device tables (``StaticTables``, one a window shape), refilled here; ``width``:
-    the pending rows a stream may hold (a captured round's fixed shape; default this round's most)."""
+    the pending rows a stream may hold (a captured round's fixed shape; default this round's most); ``folds``: fold
+    pending rows even when no stream holds any (a captured round's one variant; default when some stream does)."""
 
     def __init__(self, w, scratch: Scratch, segs: Sequence, pending: Sequence[Sequence[int]], *, static=None,
-                 width: int | None = None) -> None:
+                 width: int | None = None, folds: bool | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         lin = scratch.lin
         taps = np.arange(4)[None, :]
@@ -65,7 +66,7 @@ class Tables:
         at = 8 * rows + n + 1
         self.plan = shared.Plan(i32[5 * rows:8 * rows].view(rows, 3), i32[8 * rows:at], slots, most)
         self.held, self.held_counts = i32[at:at + n * width].view(n, width), i32[at + n * width:]
-        self.folds = bool(counts.any())
+        self.folds = bool(counts.any()) if folds is None else bool(folds)
         self.conv, self.state = i64[:lin * n].view(lin, n), i64[lin * n:].view(lin, n)
         self.scratch, self.segs, self.cur = scratch, list(segs), scratch.parity
 

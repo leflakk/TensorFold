@@ -1,9 +1,9 @@
 """Flash Next's concurrent rounds as CUDA graphs (``round_graphs``), on one GPU.
 
-Windows are padded to depth + 1 rows a stream, a stream count's verify forward and MTP steps are captured once a
-shape and replayed with each round's tables: every stream still emits its solo run (dense and sparse attention,
-quantized caches, an n-gram layer, caches that grow or move), as eager rounds do. The one-launch kernels the
-captured rounds read by table give each row the bits of its stream's own launch.
+A round's rows go up to a multiple of 4 (padding after the last stream's own), each (stream count, rows) verify
+forward and MTP step is captured once and replayed with each round's tables: every stream still emits its solo run
+(dense and sparse attention, quantized caches, an n-gram layer, caches that grow or move), as eager rounds do. The
+warm-up captures every shape; the one-launch kernels the rounds read by table give each row its stream's own bits.
 """
 
 import tempfile
@@ -69,9 +69,8 @@ def test_rounds_in_graphs_equal_each_alone(apart, graphs, kv_dtype):
     if graphs is True:
         kinds = {key[:2] for key in dec.rounds.graphs}
         assert any(k[0] == "verify" for k in kinds) and any(k[0] == "mtp" for k in kinds), kinds
-        # the first round alone (it folds nothing) and four streams: a lone request's first round replays too
-        assert {k[1] for k in kinds if k[0] == "verify"} >= {1, 4}
-        assert any(k[0] == "verify" and k[1] == 1 and not k[3] for k in dec.rounds.graphs)
+        assert {k[1] for k in kinds if k[0] == "verify"} >= {1, 4}         # the first round alone, four streams
+        assert all(key[2] % 4 == 0 or key[2] == key[1] * 4 for key in dec.rounds.graphs)   # rows: 4s, n windows
     assert len(dec.free) + len({id(k[1]) for k in dec.kept}) == 4 and not dec.live()
 
 
@@ -87,7 +86,7 @@ def test_a_warmed_decoder_replays_captured_rounds(apart):
     streams = [Stream(p, 24, smp, draft=i != 3, stop_eos=False) for i, (p, smp) in enumerate(zip(PROMPTS, SAMPLINGS))]
     replays = dec.rounds.replays
     assert _decode(dec, streams, first=4) == refs
-    assert dec.rounds.replays > replays and dec.rounds.captures - warmed <= 8     # mostly the warm-up's graphs
+    assert dec.rounds.replays > replays and dec.rounds.captures == warmed        # every shape was the warm-up's
 
 
 @pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])

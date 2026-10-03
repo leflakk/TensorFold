@@ -1,15 +1,17 @@
 """Concurrent rounds as CUDA graphs: the verify forward of n streams, and the MTP head's steps.
 
-A round's verify window holds n streams of W = drafts + 1 rows each: a shorter window is padded after its own rows
-(padding rows come after a stream's rows in its chain, so its rows keep their bits; their outputs are dropped). Its
-shape is then n, the DeltaNet scratch parity, whether last round's rows fold in, and the context bucket that bounds
-the attention launches. The tables it reads (rows' streams and positions, cache, state and n-gram tail pointers,
-the rows to fold) live in static device buffers refilled before each replay, so one graph serves any n streams.
+A round's window holds n streams' own rows (each stream its token and drafts), the total rounded up to a multiple
+of STEP by rows after the last stream's own (padding comes after a stream's rows in its chain, so its rows keep
+their bits; their outputs are dropped). Its shape is then n, its rows, the DeltaNet scratch parity and the context
+bucket that bounds the attention launches; last round's rows always fold in (none for a new stream). The tables it
+reads (rows' streams and positions, cache, state and n-gram tail pointers, the rows to fold) live in static device
+buffers refilled before each replay, so one graph serves any n streams holding those rows.
 
-A shape is captured on its first round, after an eager run of that round compiles its kernels; the DeltaNet states
-that run folded last round's rows into are put back first (a fold is not idempotent; everything else a forward
-writes, it writes again with the same bits). On tensor-parallel ranks every rank meets the same shapes at the same
-rounds, so their captures and replays pair their collectives as the eager rounds do.
+``warm`` captures every shape of the 8,192-key bucket before a request, on idle slots (a graph does not depend on
+which streams it reads); a longer context's bucket is captured on its first round, after an eager run of that round
+compiles its kernels, the DeltaNet states it folded into put back first (a fold is not idempotent; everything else
+a forward writes, it writes again with the same bits). On tensor-parallel ranks every rank meets the same shapes at
+the same rounds, so their captures and replays pair their collectives as the eager rounds do.
 """
 
 from __future__ import annotations
@@ -20,8 +22,11 @@ import os
 import torch
 
 from .forward import compute
+from .graphs import _kernel_profile
 from .mtp import mtp_compute
 from .static_tables import StaticTables
+
+STEP = 4                 # a round's rows are a multiple of this (fewer shapes; at most STEP - 1 padding rows)
 
 
 def enabled(tp: bool) -> bool:
@@ -36,18 +41,19 @@ def enabled(tp: bool) -> bool:
 
 class RoundGraphs:
     """A concurrent decoder's captured verify forwards and MTP steps, by shape; at most ``TF_MULTI_GRAPHS_MAX``
-    (default 96) graphs, the oldest dropped past it. ``capture=False``: the same padded windows and static tables,
-    run eager (ranks that are threads of one process, whose collectives sync the host, cannot be captured)."""
+    (default 160) graphs, the oldest dropped past it. ``capture=False``: the same rows and static tables, run eager
+    (ranks that are threads of one process, whose collectives sync the host, cannot be captured)."""
 
     def __init__(self, dec, *, capture: bool = True) -> None:
         self.dec, self.capture = dec, bool(capture)
-        self.width = dec.depth + 1                       # W: every stream's verify window, padded
+        self.width = dec.depth + 1                       # W: the most rows a stream's own window holds
+        self.bound = self.width + STEP - 1               # ... and with the round's padding after them
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs: dict[tuple, torch.cuda.CUDAGraph] = {}
         self.outs: dict[tuple, torch.Tensor] = {}
         self.statics: dict[tuple, StaticTables] = {}
         self.captures = self.replays = 0
-        self.most = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "96"))
+        self.limit = int(os.environ.get("TF_MULTI_GRAPHS_MAX", "160"))
         # the up projection's per-stream terms, sized for the widest window now: a graph holds their address, so a
         # later, wider window must not reallocate them (``qmm.hc_upmix`` grows its scratch on demand)
         c = dec.w.cfg
@@ -56,6 +62,23 @@ class RoundGraphs:
                 dev = b.mixed.device                     # with its index, as ``hc_upmix`` keys it
                 b.__dict__.setdefault("hc_scratch", {})[(dev, c.streams, c.hidden)] = torch.empty(
                     (c.streams * max(b.rows, 16) * c.hidden,), dtype=torch.bfloat16, device=dev)
+
+    def rows(self, n: int, own: int) -> int:
+        """The rows of a window of ``n`` streams holding ``own`` rows of their own: the next multiple of STEP, at
+        most n windows of W."""
+
+        return max(own, min(n * self.width, -(-own // STEP) * STEP))
+
+    def pad(self, windows: list) -> list:
+        """``windows`` [(state, tokens)] with the last stream's tokens repeated after its own up to the round's rows
+        (as many as its cache holds past them: a round short of its multiple is a shape of its own)."""
+
+        own = sum(len(tokens) for _, tokens in windows)
+        st, tokens = windows[-1]
+        extra = min(self.rows(len(windows), own) - own, st.capacity - st.pos - len(tokens))
+        if extra <= 0:
+            return windows
+        return [*windows[:-1], (st, list(tokens) + [tokens[-1]] * extra)]
 
     def static(self, key: tuple) -> StaticTables:
         got = self.statics.get(key)
@@ -82,7 +105,7 @@ class RoundGraphs:
                 gc.enable()
         torch.cuda.synchronize()
         self.captures += 1
-        while len(self.graphs) >= self.most:     # the oldest shape goes (captured again if it comes back)
+        while len(self.graphs) >= self.limit:    # the oldest shape goes (captured again if it comes back)
             old = next(iter(self.graphs))
             del self.graphs[old]
             self.outs.pop(old, None)
@@ -93,9 +116,10 @@ class RoundGraphs:
 
         d = self.dec
         w, b = d.w, d.buf
+        R = segs[-1][2]
         if not self.capture:
             return compute(w, segs, b)
-        key = ("verify", len(segs), tables.cur, tables.folds, step.context)
+        key = ("verify", len(segs), R, tables.cur, tables.folds, step.context)
         g = self.graphs.get(key)
         if g is None:
             saved = []
@@ -110,9 +134,13 @@ class RoundGraphs:
             del saved
             g = self._capture(lambda: compute(w, segs, b))
             self.graphs[key] = g
+        # TF_PROFILE_KERNELS=K: rank 0 runs its K-th round of each stream count eagerly under the profiler (the other
+        # ranks replay the same kernels in the same order, so the collectives pair up)
+        if _kernel_profile(w, R, lambda: compute(w, segs, b), g, f"concurrent verify, {len(segs)} streams"):
+            return b.logits[:R]
         g.replay()
         self.replays += 1
-        return b.logits[:segs[-1][2]]
+        return b.logits[:R]
 
     def mtp(self, segs, step) -> torch.Tensor:
         """An MTP step over ``segs`` (``mbuf.attn_step`` set to ``step``): each stream's draft-head logits."""
@@ -128,6 +156,68 @@ class RoundGraphs:
             g = self._capture(lambda: mtp_compute(w, segs, b, pick=True))
             self.graphs[key] = g
             self.outs[key] = out
+        if _kernel_profile(w, segs[-1][2], lambda: mtp_compute(w, segs, b, pick=True), g,
+                           f"concurrent MTP step, {len(segs)} streams"):
+            return self.outs[key]
         g.replay()
         self.replays += 1
         return self.outs[key]
+
+    def warm(self, states: list) -> None:
+        """Capture every verify shape (1 to ``len(states)`` streams, each row count, both DeltaNet parities) and
+        every MTP step shape of the 8,192-key bucket, on ``states`` (idle slots, emptied afterwards): a graph reads
+        its streams by table, so any streams of a shape replay it."""
+
+        if not self.capture:
+            return
+        from . import attn_multi, gdn_multi
+        from .forward import stage
+        from .mtp import mtp_stage
+
+        d = self.dec
+        w = d.w
+        context = self.bucket(1)
+        saved_parity = d.gdn.parity
+        try:
+            for n in range(1, len(states) + 1):
+                shapes = sorted({self.rows(n, own) for own in range(n, n * self.width + 1)})
+                for R in shapes:
+                    for parity in (0, 1):
+                        d.gdn.parity = parity
+                        segs = stage(w, d.buf, _split(states[:n], R))
+                        tables = gdn_multi.Tables(w, d.gdn, segs, [[] for _ in segs],
+                                                  static=self.static(("gdn", n)), width=self.width, folds=True)
+                        step = attn_multi.Step(w, segs, mtp=False, static=self.static(("attn", n)), context=context,
+                                               most=self.bound)
+                        d.buf.gdn_tables, d.buf.attn_step = tables, step
+                        try:
+                            self.verify(segs, tables, step)
+                        finally:
+                            d.buf.gdn_tables = d.buf.attn_step = None
+                if d.mbuf is None:
+                    continue
+                for R in sorted(set(shapes) | {self.rows(n, n)}):      # absorbs of R rows; a draft step's rows
+                    windows, a0 = [], 0
+                    for st, tokens in _split(states[:n], R):
+                        windows.append((st, tokens, d.mbuf.mtp_in[a0:a0 + len(tokens)]))
+                        a0 += len(tokens)
+                    segs = mtp_stage(w, d.mbuf, windows)
+                    step = attn_multi.Step(w, segs, mtp=True, static=self.static(("mtp", n, R)), context=context,
+                                           most=self.bound)
+                    d.mbuf.attn_step = step
+                    try:
+                        self.mtp(segs, step)
+                    finally:
+                        d.mbuf.attn_step = None
+        finally:
+            d.gdn.parity = saved_parity
+            for st in states:
+                st.reset(w)
+            torch.cuda.synchronize()
+
+
+def _split(states: list, rows: int) -> list:
+    """``rows`` rows of token 1 over ``states``, as evenly as they go (a synthetic window)."""
+
+    n = len(states)
+    return [(st, [1] * (rows // n + (i < rows % n))) for i, st in enumerate(states)]

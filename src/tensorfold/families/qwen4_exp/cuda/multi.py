@@ -238,30 +238,8 @@ class MultiDecoder:
         self._shrink(s.st)
         if all(f is not s.st for f in self.free):
             self.free.append(s.st)
-        if self.rounds is not None:
-            self._warm_rounds()
-
-    def _warm_rounds(self) -> None:
-        """Captured rounds before any request: 1 to ``slots`` short drafting streams decode together a few rounds, so
-        each stream count's verify graphs (both DeltaNet parities, as their rounds reach them) and MTP steps are
-        captured now, not on a request's round. Every slot is empty again afterwards."""
-
-        for n in range(1, self.slots + 1):
-            streams = [Stream([1 + i, 2, 3, 4], 2 * self.depth + 6, None, stop_eos=False) for i in range(n)]
-            for s in streams:
-                self.admit(s)
-            for _ in range(8 * (self.depth + 2)):
-                if not self.live():
-                    break
-                self.finish(self.round())
-            for s in streams:
-                self.streams.pop(s.sid, None)
-                self.held.pop(s.sid, None)
-        for _, st, _, _ in self.kept:                  # the warm prompts' kept ends go
-            self._shrink(st)
-            if all(f is not st for f in self.free):
-                self.free.append(st)
-        self.kept = []
+        if self.rounds is not None:                      # every shape of rounds and MTP steps, on idle slots
+            self.rounds.warm(list(self.free[:self.slots]))
 
     @torch.no_grad()
     def admit(self, s: Stream) -> None:
@@ -372,7 +350,7 @@ class MultiDecoder:
                 raise
             return self._failed(pieces, exc)
         rows = sum(n for _, _, n in pieces)
-        if self.clock and rows:                          # a pass alone: what a prompt row costs (--decode-share)
+        if self.clock and rows and self.share > 0:       # a pass alone: what a prompt row costs (--decode-share)
             torch.cuda.synchronize()
             per = (time.perf_counter() - t0) / rows
             self.row_s = per if self.row_s is None else 0.7 * self.row_s + 0.3 * per
@@ -533,9 +511,8 @@ class MultiDecoder:
         prof = _Profile.make(self.w)                     # TF_PROFILE_DECODE=N: where rounds' time goes (rank 0)
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
-        W = self.depth + 1                               # captured rounds: every window padded to W rows
-        segs = stage(self.w, self.buf, windows if self.rounds is None else
-                     [(st, tokens + [tokens[-1]] * (W - len(tokens))) for st, tokens in windows])
+        # captured rounds: the round's rows to a multiple of 4, padding after the last stream's own
+        segs = stage(self.w, self.buf, windows if self.rounds is None else self.rounds.pad(windows))
         ranges = [(a0, a0 + len(tokens)) for (_, a0, _), (_, tokens) in zip(segs, windows)]   # each stream's rows
         # a pass shares the round's forward only where their experts share a launch; else _fill ran it between rounds
         pieces, psegs = (self._pieces(self._pass_rows()) if self.filling and self.converged else []), None
@@ -551,10 +528,11 @@ class MultiDecoder:
         held = [self.held.pop(s.sid, []) for s in live]
         graphed = self.rounds is not None and not pieces and all(st.image_positions is None for st, _, _ in segs)
         if graphed:                                      # this shape's device tables, refilled
-            n = len(segs)
-            tables = gdn_multi.Tables(self.w, self.gdn, segs, held, static=self.rounds.static(("gdn", n)), width=W)
-            step = attn_multi.Step(self.w, segs, mtp=False, static=self.rounds.static(("attn", n)),
-                                   context=self.rounds.bucket(max(st.pos for st, _, _ in segs) + W))
+            n, R, rg = len(segs), segs[-1][2], self.rounds
+            tables = gdn_multi.Tables(self.w, self.gdn, segs, held, static=rg.static(("gdn", n, R)),
+                                      width=rg.width, folds=True)
+            step = attn_multi.Step(self.w, segs, mtp=False, static=rg.static(("attn", n, R)),
+                                   context=rg.bucket(max(a1 - a0 + st.pos for st, a0, a1 in segs)), most=rg.bound)
         else:
             tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
             step = attn_multi.Step(self.w, segs, mtp=False)
@@ -566,7 +544,7 @@ class MultiDecoder:
                 pends = self._end_rows(pieces, psegs)
                 logits, heads = compute_mixed(self.w, segs, self.buf, psegs, self.pbuf, ends=pends, cuts=cuts)
                 heads = heads[:len(pends)].clone() if pends else None
-            elif graphed:                              # a captured shape (first rounds, folding nothing, too)
+            elif graphed:                              # a captured shape (a new stream's round folds nothing)
                 logits = self.rounds.verify(segs, tables, step)
             else:
                 logits = compute(self.w, segs, self.buf)
@@ -646,12 +624,9 @@ class MultiDecoder:
             windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
             segs = mtp_stage(self.w, self.mbuf, windows)
             lasts = [a1 - 1 for _, _, a1 in segs]
-        else:                                            # captured steps: each stream's rows padded to W
-            W = self.depth + 1
-            windows = [(s.st, list(keep) + [keep[-1]] * (W - len(keep)), self.buf.streams[a0:a0 + W])
-                       for s, a0, keep in todo]
-            lasts = [i * W + len(keep) - 1 for i, (_, _, keep) in enumerate(todo)]
-            segs = mtp_stage(self.w, self.mbuf, windows, lasts=lasts)
+        else:                                            # a captured step: its rows to a multiple of 4
+            segs, lasts = self._mtp_stage([(s.st, keep, self.buf.streams[a0:a0 + len(keep)])
+                                           for s, a0, keep in todo])
         logits = self._mtp(segs)
         for s, _, keep in todo:
             s.st.set_mtp_len(s.st.mtp_len + len(keep))
@@ -669,12 +644,37 @@ class MultiDecoder:
             if not nxt:
                 return
             windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
-            segs = mtp_stage(self.w, self.mbuf, windows)
+            if self.rounds is None:
+                segs = mtp_stage(self.w, self.mbuf, windows)
+                lasts = [a0 for _, a0, _ in segs]
+            else:
+                segs, lasts = self._mtp_stage(windows)
             logits = self._mtp(segs)
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1
-            active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+            active = [(s, row) for (s, _, _), row in zip(nxt, lasts)]
+
+    def _mtp_stage(self, windows: list) -> tuple[list, list[int]]:
+        """A captured MTP step's ``mtp_stage``: the streams' rows written into the head's input rows in place, the
+        last stream's repeated after its own up to the step's rows (``RoundGraphs.rows``); and each stream's last
+        own row."""
+
+        own = sum(len(tokens) for _, tokens, _ in windows)
+        last = windows[-1][0]                            # padding no further than its MTP cache holds
+        extra = min(self.rounds.rows(len(windows), own) - own, last.capacity - last.mtp_len - len(windows[-1][1]))
+        staged, lasts, a0 = [], [], 0
+        mtp_in = self.mbuf.mtp_in
+        for i, (st, tokens, streams) in enumerate(windows):
+            n = len(tokens)
+            mtp_in[a0:a0 + n].copy_(streams, non_blocking=True)
+            if i == len(windows) - 1 and extra > 0:     # padding rows: the last own row again
+                mtp_in[a0 + n:a0 + n + extra].copy_(streams[n - 1:n].expand(extra, -1), non_blocking=True)
+                tokens, n = list(tokens) + [tokens[-1]] * extra, n + extra
+            staged.append((st, tokens, mtp_in[a0:a0 + n]))
+            lasts.append(a0 + len(windows[i][1]) - 1)
+            a0 += n
+        return mtp_stage(self.w, self.mbuf, staged, lasts=lasts), lasts
 
     @staticmethod
     def _sample(logits: torch.Tensor, ranges: list, positions: list, samplings: list) -> list[list[int]]:
@@ -713,10 +713,10 @@ class MultiDecoder:
         if self.rounds is None:
             self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
         else:
-            rows = segs[-1][2]
+            rows, rg = segs[-1][2], self.rounds
             self.mbuf.attn_step = attn_multi.Step(
-                self.w, segs, mtp=True, static=self.rounds.static(("mtp", len(segs), rows)),
-                context=self.rounds.bucket(max(st.mtp_len for st, _, _ in segs) + rows // len(segs)))
+                self.w, segs, mtp=True, static=rg.static(("mtp", len(segs), rows)),
+                context=rg.bucket(max(st.mtp_len + a1 - a0 for st, a0, a1 in segs)), most=rg.bound)
         try:
             if self.rounds is not None:
                 return self.rounds.mtp(segs, self.mbuf.attn_step)
