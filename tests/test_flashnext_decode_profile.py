@@ -29,11 +29,14 @@ def test_rounds_are_profiled_by_stream_count_and_each_print_covers_the_last_roun
         prof.since("outside", prof.last - 0.004)
         prof.since("outside", None)                                                      # (not counted)
         prof.mark("verify", 20)
+        prof.count("padding", 1)
+        prof.gauge("graphs captured", 57)
         prof.round()
     out = capsys.readouterr().out
     assert "decode profile (4 streams) over 2 rounds" in out and "outside 4.00 ms" in out
-    assert "verify rows 20.00" in out
+    assert "verify rows 20.00 (padding 1.00)" in out and out.rstrip().endswith("a round; graphs captured 57")
     assert (four.rounds, four.seconds, four.counts) == (0, {}, {})                       # the next print starts over
+    assert four.gauges == {"graphs captured": 57}
     one = decode._Profile.make(w, 1)
     one.round()
     one.round()

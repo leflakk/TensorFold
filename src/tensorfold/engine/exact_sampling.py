@@ -54,12 +54,26 @@ def seed_for(tokens: Sequence[int], salt: int | None = None) -> int:
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
+_M64 = (1 << 64) - 1
+
+
 def _mix(x: np.ndarray) -> np.ndarray:
     x = x ^ (x >> np.uint64(30))
     x = x * np.uint64(0xBF58476D1CE4E5B9)
     x = x ^ (x >> np.uint64(27))
     x = x * np.uint64(0x94D049BB133111EB)
     return x ^ (x >> np.uint64(31))
+
+
+def _seed_mix(seed: int) -> int:
+    """``_mix(uint64(seed) + golden)`` of one seed in Python ints: the same bits, without numpy scalar ops."""
+
+    x = ((int(seed) & _M64) + 0x9E3779B97F4A7C15) & _M64
+    x ^= x >> 30
+    x = (x * 0xBF58476D1CE4E5B9) & _M64
+    x ^= x >> 27
+    x = (x * 0x94D049BB133111EB) & _M64
+    return x ^ (x >> 31)
 
 
 def uniform(seed: int, position: int, ids: np.ndarray) -> np.ndarray:
@@ -72,11 +86,15 @@ def uniform(seed: int, position: int, ids: np.ndarray) -> np.ndarray:
     return (x >> np.uint64(11)).astype(np.float64) * 2.0 ** -53 + 2.0 ** -54
 
 
-def uniform_rows(seed: int, positions: np.ndarray, ids: np.ndarray) -> np.ndarray:
-    """``uniform`` for many positions at once: row r is ``uniform(seed, positions[r], ids[r])``, same bits."""
+def uniform_rows(seed: int | Sequence[int], positions: np.ndarray, ids: np.ndarray) -> np.ndarray:
+    """``uniform`` for many positions at once: row r is ``uniform(seed, positions[r], ids[r])``, same bits; ``seed``
+    one for every row or one a row (``uniform(seed[r], ...)``)."""
 
+    if np.ndim(seed):
+        x = np.array([_seed_mix(v) for v in seed], dtype=np.uint64)[:, None]
+    else:
+        x = np.uint64(_seed_mix(seed))
     with np.errstate(over="ignore"):
-        x = _mix(np.uint64(seed & 0xFFFFFFFFFFFFFFFF) + np.uint64(0x9E3779B97F4A7C15))
         x = _mix(x ^ (np.asarray(positions).astype(np.uint64)[:, None] * np.uint64(0xD1B54A32D192ED03)))
         x = _mix(x ^ ids.astype(np.uint64))
     return (x >> np.uint64(11)).astype(np.float64) * 2.0 ** -53 + 2.0 ** -54
@@ -101,15 +119,18 @@ def choose(values: np.ndarray, ids: np.ndarray, position: int, s: Sampling) -> i
     return int(ids[int(np.argmax(scaled + gumbel))])
 
 
-def choose_rows(values: np.ndarray, ids: np.ndarray, positions: Sequence[int], s: Sampling) -> list[int]:
-    """Choose each row with the same operation order and bits as an independent ``choose`` call."""
+def choose_rows(values: np.ndarray, ids: np.ndarray, positions: Sequence[int], s: Sampling,
+                seeds: Sequence[int] | None = None) -> list[int]:
+    """Choose each row with the same operation order and bits as an independent ``choose`` call; ``seeds``: one a
+    row (rows of one rule from several requests in one call), else ``s.seed`` for every row."""
 
     rows, width = ids.shape
     order = np.lexsort((ids, -values), axis=-1)
     k = max(1, min(int(s.top_k) if s.top_k else width, width))
-    ids = np.take_along_axis(ids, order, axis=-1)[:, :k]
-    scaled = np.take_along_axis(values, order, axis=-1)[:, :k].astype(np.float64) / max(float(s.temperature), 1e-6)
-    score = scaled - np.log(-np.log(uniform_rows(s.seed, np.asarray(positions), ids)))
+    order, r = order[:, :k], np.arange(rows)[:, None]
+    ids = ids[r, order]
+    scaled = values[r, order].astype(np.float64) / max(float(s.temperature), 1e-6)
+    score = scaled - np.log(-np.log(uniform_rows(s.seed if seeds is None else seeds, np.asarray(positions), ids)))
     if 0.0 < s.top_p < 1.0:
         probs = np.exp(scaled - scaled.max(axis=-1, keepdims=True))
         probs /= probs.sum(axis=-1, keepdims=True)
@@ -117,7 +138,7 @@ def choose_rows(values: np.ndarray, ids: np.ndarray, positions: Sequence[int], s
         score[np.arange(k)[None, :] >= keep[:, None]] = -np.inf
     if s.min_p > 0.0:
         score[scaled < scaled[:, :1] + s.min_log] = -np.inf               # ``choose``'s min_p prefix
-    return [int(t) for t in ids[np.arange(rows), np.argmax(score, axis=-1)]]
+    return ids[np.arange(rows), np.argmax(score, axis=-1)].tolist()
 
 
 def top_candidates(logits: Any, s: Sampling) -> tuple[Any, Any] | None:

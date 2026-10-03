@@ -115,6 +115,39 @@ def choose_host(host: tuple, a0: int, a1: int, positions: Sequence[int], samplin
     return chosen, probs
 
 
+def choose_host_rows(host: tuple, rows: Sequence[int], positions: Sequence[int], samplings: Sequence,
+                     with_prob: bool = False):
+    """``choose_host`` of single rows of ``gathered_host``'s candidates, each at its position with its sampler: the
+    rows of one rule (greedy, or one temperature, top-k, top-p and min-p, whatever their seeds) in one draw, each
+    with the bits it draws alone (several streams' rows, one call a rule instead of one a stream)."""
+
+    first = samplings[0] if len(samplings) else None
+    if all(smp is first for smp in samplings) and list(rows) == list(range(rows[0], rows[0] + len(rows))):
+        return choose_host(host, rows[0], rows[0] + len(rows), positions, first, with_prob)     # one stream's rows
+    chosen, groups = [0] * len(rows), {}
+    for j, smp in enumerate(samplings):
+        rule = None if smp is None or smp.temperature <= 0 else (smp.temperature, smp.top_k, smp.top_p, smp.min_p)
+        groups.setdefault(rule, []).append(j)
+    for rule, js in groups.items():
+        at = np.asarray([rows[j] for j in js])
+        values, tokens = host[0][at], host[1][at]
+        if rule is None:
+            order = np.lexsort((tokens, -values), axis=-1)
+            got = tokens[np.arange(len(js)), order[:, 0]].tolist()
+        else:
+            got = choose_rows(values, tokens, [positions[j] for j in js], samplings[js[0]],
+                              seeds=[samplings[j].seed for j in js])
+        for j, t in zip(js, got):
+            chosen[j] = int(t)
+    if not with_prob:
+        return chosen
+    probs = []
+    for r, t in zip(rows, chosen):
+        hit = np.nonzero(host[1][r] == t)[0]
+        probs.append(float(np.exp(float(host[0][r, hit[0]]) - host[2][r])) if len(hit) else 0.0)
+    return chosen, probs
+
+
 def choose_gathered(w: Weights, cand_all: torch.Tensor, R: int, positions: Sequence[int], sampling: Sampling | None,
                     with_prob: bool = False):
     """Apply keyed sampling to candidates gathered inside the step graph; ``with_prob`` also returns each selected token's probability."""
@@ -494,6 +527,7 @@ class _Profile:
         self.every, self.streams, self.rounds = every, streams, 0
         self.seconds: dict[str, float] = {}
         self.counts: dict[str, int] = {}
+        self.gauges: dict[str, int] = {}               # values printed as they last were (graphs captured so far)
         self.last = time.perf_counter()
 
     def mark(self, phase: str, count: int = 0) -> None:
@@ -512,6 +546,9 @@ class _Profile:
     def count(self, name: str, n: int) -> None:
         self.counts[name] = self.counts.get(name, 0) + n
 
+    def gauge(self, name: str, value: int) -> None:
+        self.gauges[name] = value
+
     def round(self) -> None:
         self.rounds += 1
         if self.rounds % self.every:
@@ -520,10 +557,13 @@ class _Profile:
         total = sum(self.seconds.values())
         parts = ", ".join(f"{k} {v / n * 1e3:.2f} ms" for k, v in self.seconds.items())
         streams = f"streams {self.counts['streams'] / n:.2f}, " if "streams" in self.counts else ""
+        padding = f" (padding {self.counts['padding'] / n:.2f})" if "padding" in self.counts else ""
+        gauges = "".join(f"; {k} {v}" for k, v in self.gauges.items())
         label = "" if self.streams is None else f" ({self.streams} stream{'s' if self.streams > 1 else ''})"
         print(f"[tensorfold] decode profile{label} over {n} rounds: {total / n * 1e3:.2f} ms a round ({parts}); "
               f"{streams}drafts {self.counts.get('draft', 0) / n:.2f}, verify rows "
-              f"{self.counts.get('verify', 0) / n:.2f}, kept {self.counts.get('commit', 0) / n:.2f} a round", flush=True)
+              f"{self.counts.get('verify', 0) / n:.2f}{padding}, kept {self.counts.get('commit', 0) / n:.2f} a round"
+              f"{gauges}", flush=True)
         self.rounds, self.seconds, self.counts = 0, {}, {}       # each print: the last N rounds
 
 

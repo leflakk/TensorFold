@@ -108,3 +108,23 @@ def test_nucleus_without_top_k_matches_the_whole_vocabulary_draw():
     assert drawn > 40
     flat = mx.zeros((1, 50_000), dtype=mx.bfloat16)          # every token tied: the nucleus needs them all
     assert es._nucleus_rows(flat, [0], es.Sampling(seed=1, top_k=0, top_p=0.95)) is None
+
+
+def test_rows_of_several_seeds_draw_as_each_alone():
+    """``seeds``: rows of one rule from several requests in one call, each row the draw its own seed gives."""
+
+    from tensorfold.engine.exact_sampling import choose_rows, uniform_rows
+
+    rng = np.random.default_rng(11)
+    for trial in range(200):
+        rows = int(rng.choice([1, 2, 5, 13]))
+        rule = dict(temperature=float(rng.choice([0.6, 1.0])), top_k=int(rng.choice([0, 20])),
+                    top_p=[0.95, 1.0, 0.5][trial % 3], min_p=[0.0, 0.05][trial % 2])
+        seeds = [int(x) for x in rng.integers(0, 2**63 - 1, rows)]
+        values = rng.normal(0, 3.0, (rows, 64)).astype(np.float32)
+        ids = np.stack([rng.choice(248320, 64, replace=False) for _ in range(rows)]).astype(np.int64)
+        positions = rng.integers(0, 100000, rows)
+        want = [choose(values[r], ids[r], int(positions[r]), Sampling(seed=seeds[r], **rule)) for r in range(rows)]
+        assert choose_rows(values, ids, positions, Sampling(seed=1, **rule), seeds=seeds) == want
+        u = uniform_rows(seeds, positions, ids)
+        assert all(np.array_equal(u[r], uniform(seeds[r], int(positions[r]), ids[r])) for r in range(rows))

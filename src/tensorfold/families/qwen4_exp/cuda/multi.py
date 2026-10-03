@@ -18,7 +18,7 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import (PAIR_MIN, PREFILL_ROWS, WARM_TAIL, Engine, _Profile, _gathered_fits, choose_host, draft,
+from .decode import (PAIR_MIN, PREFILL_ROWS, WARM_TAIL, Engine, _Profile, _gathered_fits, choose_host_rows, draft,
                      entry_end, gathered_host, pair_prefill, prefill_begin, prefill_chunk, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes, round_graphs
 from .forward import Cut, Overlap, commit, compute, compute_mixed, converges, cut_snapshot, stage
@@ -569,6 +569,9 @@ class MultiDecoder:
         if prof:
             prof.mark("verify", segs[-1][2])
             prof.count("streams", len(live))
+            prof.count("padding", segs[-1][2] - ranges[-1][1])          # rows past the last stream's own
+            if self.rounds is not None and self.rounds.capture:
+                prof.gauge("graphs captured", self.rounds.captures)
         lasts = self._absorb(pieces, psegs, cuts) if pieces else None
         offset = int(self.w.meta.get("vocab_offset", 0))                # tensor parallel: this rank's columns
         for s, (a0, a1) in zip(live, ranges):
@@ -710,19 +713,25 @@ class MultiDecoder:
     def _tp_sample(self, logits: torch.Tensor, ranges: list, positions: list, live: list, masked,
                    rows: int) -> list[list[int]]:
         """Tensor parallel: each stream's rows from every rank's candidates, gathered in the forward (one read-back
-        of the window's ``rows``); a grammar's masked rows, or a sampler they don't cover, draw over the masked
-        shards with a gather of their own (every rank takes the same ones, in order)."""
+        of the window's ``rows``), every stream's rows of one sampling rule in one draw; a grammar's masked rows, or a
+        sampler they don't cover, draw over the masked shards with a gather of their own (every rank takes the same
+        ones, in order)."""
 
-        w, host, out = self.w, None, []
+        w, out = self.w, [None] * len(live)
+        at, spans, pos, smps = [], [], [], []           # the gathered rows: their streams' spans, positions, samplers
         for i, s in enumerate(live):
             a0, a1 = ranges[i]
             if s.sid in masked or not _gathered_fits(s.sampling):
-                out.append(tp_sample_rows(w, logits[a0:a1], positions[i], s.sampling,
-                                          offset=int(w.meta["vocab_offset"])))
+                out[i] = tp_sample_rows(w, logits[a0:a1], positions[i], s.sampling, offset=int(w.meta["vocab_offset"]))
                 continue
-            if host is None:
-                host = gathered_host(w, self.buf.cand_all, rows)
-            out.append(choose_host(host, a0, a1, positions[i], s.sampling))
+            spans.append((i, len(at), a1 - a0))
+            at += range(a0, a1)
+            pos += positions[i]
+            smps += [s.sampling] * (a1 - a0)
+        if at:
+            got = choose_host_rows(gathered_host(w, self.buf.cand_all, rows), at, pos, smps)
+            for i, j, n in spans:
+                out[i] = got[j:j + n]
         return out
 
     def _mtp(self, segs: list) -> torch.Tensor:
@@ -769,19 +778,23 @@ class MultiDecoder:
         return out
 
     def _tp_picks(self, logits: torch.Tensor, positions: list[int], samplings: list) -> list[tuple[int, float]]:
-        """``_picks`` from every rank's draft candidates, gathered in the MTP step (``mbuf.cand_all``, one read-back);
-        a sampler they don't cover draws over the shards with its own gather."""
+        """``_picks`` from every rank's draft candidates, gathered in the MTP step (``mbuf.cand_all``, one read-back),
+        the streams of one sampling rule in one draw; a sampler they don't cover draws over the shards with its own
+        gather."""
 
-        w, host, out = self.w, None, []
+        w, out, fits = self.w, [None] * len(positions), []
         for i, (pos, smp) in enumerate(zip(positions, samplings)):
-            if not _gathered_fits(smp):
-                toks, probs = tp_sample_rows(w, logits[i:i + 1], [pos], smp, offset=int(w.meta["vocab_offset"]),
-                                             id_map=w.draft_ids, with_prob=True)
-            else:
-                if host is None:
-                    host = gathered_host(w, self.mbuf.cand_all, len(positions))
-                toks, probs = choose_host(host, i, i + 1, [pos], smp, with_prob=True)
-            out.append((int(toks[0]), float(probs[0])))
+            if _gathered_fits(smp):
+                fits.append(i)
+                continue
+            toks, probs = tp_sample_rows(w, logits[i:i + 1], [pos], smp, offset=int(w.meta["vocab_offset"]),
+                                         id_map=w.draft_ids, with_prob=True)
+            out[i] = (int(toks[0]), float(probs[0]))
+        if fits:
+            toks, probs = choose_host_rows(gathered_host(w, self.mbuf.cand_all, len(positions)), fits,
+                                           [positions[i] for i in fits], [samplings[i] for i in fits], with_prob=True)
+            for i, t, p in zip(fits, toks, probs):
+                out[i] = (int(t), float(p))
         return out
 
     def finish(self, done: list[Stream]) -> None:
