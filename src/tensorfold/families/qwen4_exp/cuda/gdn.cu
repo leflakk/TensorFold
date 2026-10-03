@@ -71,16 +71,43 @@ __global__ void __launch_bounds__(1024) chain_kernel(
     for (int j = 0; j < 4; ++j)
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
+    // This thread's conv taps in registers: the weights, a window over [conv state (3 rows) | the rows], and the
+    // next row's inputs read while this row computes (the loads left the serial chain; the sums are unchanged).
+    float cwv[TAPS], xw[TAPS - 1];
+    float xnext = 0.0f, znext = 0.0f, bnext = 0.0f, anext = 0.0f;
+    const bool gate_lane = warp == 2 && lane == 0;
+    if (c >= 0) {
+#pragma unroll
+        for (int tap = 0; tap < TAPS; ++tap) cwv[tap] = __bfloat162float(cw[c * TAPS + tap]);
+#pragma unroll
+        for (int i = 0; i < TAPS - 1; ++i) xw[i] = __bfloat162float(cs[i * C + c]);
+        if (rows > 0) xnext = __bfloat162float(P[c]);
+    }
+    if (rows > 0) {
+        if (t < DV) znext = __bfloat162float(P[C + hv * DV + t]);
+        if (gate_lane) {
+            bnext = __bfloat162float(P[C + NV * DV + hv]);
+            anext = __bfloat162float(P[C + NV * DV + NV + hv]);
+        }
+    }
     for (int r = 0; r < rows; ++r) {
+        const float xnew = xnext, zr = znext, br = bnext, ar = anext;
+        if (r + 1 < rows) {
+            const size_t nxt = (size_t)(r + 1) * PW;
+            if (c >= 0) xnext = __bfloat162float(P[nxt + c]);
+            if (t < DV) znext = __bfloat162float(P[nxt + C + hv * DV + t]);
+            if (gate_lane) {
+                bnext = __bfloat162float(P[nxt + C + NV * DV + hv]);
+                anext = __bfloat162float(P[nxt + C + NV * DV + NV + hv]);
+            }
+        }
         if (c >= 0) {
             float acc = 0.0f;
 #pragma unroll
-            for (int tap = 0; tap < TAPS; ++tap) {
-                const int at = r + tap;
-                const float x = at < TAPS - 1 ? __bfloat162float(cs[at * C + c])
-                                              : __bfloat162float(P[(size_t)(at - (TAPS - 1)) * PW + c]);
-                acc = acc + __bfloat162float(cw[c * TAPS + tap]) * x;
-            }
+            for (int tap = 0; tap < TAPS; ++tap) acc = acc + cwv[tap] * (tap < TAPS - 1 ? xw[tap] : xnew);
+#pragma unroll
+            for (int i = 0; i < TAPS - 2; ++i) xw[i] = xw[i + 1];
+            xw[TAPS - 2] = xnew;
             const float act = bf(acc / (1.0f + expf(-acc)));
             if (t < DK) qs[t] = act;
             else if (t < 2 * DK) ks[t - DK] = act;
@@ -98,9 +125,8 @@ __global__ void __launch_bounds__(1024) chain_kernel(
             __syncwarp();
 #pragma unroll
             for (int i = 0; i < 4; ++i) x[lane * 4 + i] = v4[i] * inv;
-        } else if (warp == 2 && lane == 0) {
-            const float b = __bfloat162float(P[(size_t)r * PW + C + NV * DV + hv]);
-            const float a = __bfloat162float(P[(size_t)r * PW + C + NV * DV + NV + hv]);
+        } else if (gate_lane) {
+            const float b = br, a = ar;
             gates[0] = expf(-expf(a_log[hv]) * softplusf_(a + dt_bias[hv]));
             gates[1] = bf(sigmoidf_(b));
         }
@@ -135,7 +161,7 @@ __global__ void __launch_bounds__(1024) chain_kernel(
         __syncthreads();
         if (t < DV) {
             const float yn = bf(bf(ys[t] * rinv) * __bfloat162float(norm_w[t]));
-            const float z = __bfloat162float(P[(size_t)r * PW + C + hv * DV + t]);
+            const float z = zr;
             const float o = bf(yn * sigmoidf_(z));
             out[(size_t)r * NV * DV + hv * DV + t] = __float2bfloat16_rn(o);
             const float gs = warp_sum(o);

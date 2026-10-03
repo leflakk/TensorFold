@@ -41,7 +41,7 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     start = time.perf_counter()
     first = last = None
-    usage = None
+    usage = stats = None
     text = []
     with urllib.request.urlopen(req, timeout=600) as resp:
         for raw in resp:
@@ -51,6 +51,8 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
             chunk = json.loads(line[5:])
             if chunk.get("usage"):
                 usage = chunk["usage"]
+            if chunk.get("tensorfold"):
+                stats = chunk["tensorfold"]
             for choice in chunk.get("choices", []):
                 piece = choice.get("text") or (choice.get("delta") or {}).get("content") or ""
                 if piece:
@@ -59,8 +61,13 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
                     last = now
                     text.append(piece)
     n = int(usage["completion_tokens"]) if usage else None
+    rounds = int((stats or {}).get("rounds") or 0)
+    engine_s = float((stats or {}).get("decode_s") or 0.0)
     return {"ttft_s": first - start, "decode_s": last - first, "tokens": n,
-            "decode_tps": (n - 1) / (last - first) if n and last > first else None, "text": "".join(text)}
+            "decode_tps": (n - 1) / (last - first) if n and last > first else None, "text": "".join(text),
+            # the engine's own clock: a round's time (kernel speed) and tokens a round (drafting), apart
+            "ms_round": engine_s / rounds * 1e3 if rounds else None,
+            "tokens_round": (n - 1) / rounds if rounds and n else None}
 
 
 def main() -> None:
@@ -92,9 +99,13 @@ def main() -> None:
             row = {"label": args.label, "prompt": item["name"], "temperature": temp, "tokens": args.tokens,
                    "decode_tps_median": statistics.median(tps), "decode_tps_all": [round(x, 2) for x in tps],
                    "ttft_s_median": statistics.median(r["ttft_s"] for r in runs),
+                   "ms_round_median": statistics.median([r["ms_round"] for r in runs if r["ms_round"]] or [0.0]),
+                   "tokens_round_median": statistics.median([r["tokens_round"] for r in runs if r["tokens_round"]]
+                                                            or [0.0]),
                    "sample": runs[0]["text"][:160]}
-            print(json.dumps({k: row[k] for k in ("label", "prompt", "temperature", "decode_tps_median",
-                                                   "decode_tps_all", "ttft_s_median")}), flush=True)
+            print(json.dumps({k: (round(row[k], 3) if isinstance(row[k], float) else row[k])
+                              for k in ("label", "prompt", "temperature", "decode_tps_median", "decode_tps_all",
+                                        "ttft_s_median", "ms_round_median", "tokens_round_median")}), flush=True)
             results.append(row)
     if args.output:
         with open(args.output, "w") as f:

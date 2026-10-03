@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Sequence
 
 import numpy as np
@@ -497,17 +498,25 @@ def finish(w: Weights, mixer: HC, b: Buffers, R: int, pending, logits: bool = Tr
     return out
 
 
+_TOPK_KERNEL = os.environ.get("TF_TOPK", "triton").strip().lower() != "torch"   # TF_TOPK=torch: torch.topk
+
+
 def candidates(w: Weights, b: Buffers, logits: torch.Tensor, R: int, *, id_map: torch.Tensor | None = None,
                offset: int = 0) -> None:
     """Gather each rank's top CAND values, global ids as int32 bits and log-sum-exp into b.cand_all [world, R, 2 CAND + 1] inside the step graph, avoiding a sampling collective."""
 
-    lf = logits.float()
-    vals, idx = torch.topk(lf, CAND, dim=-1, sorted=False)
-    ids = (id_map[idx] if id_map is not None else idx + offset).to(torch.int32)
     c = b.cand[:R]
-    c[:, :CAND] = vals
-    c[:, CAND:2 * CAND] = ids.view(torch.float32)
-    c[:, 2 * CAND:] = torch.logsumexp(lf, dim=-1, keepdim=True)
+    if _TOPK_KERNEL:             # two Triton passes (topk.py): 59 us -> a few on the draft head, lowest id among equals
+        from .topk import candidates as top
+
+        top(logits, c, CAND, offset=offset, id_map=id_map)
+    else:
+        lf = logits.float()
+        vals, idx = torch.topk(lf, CAND, dim=-1, sorted=False)
+        ids = (id_map[idx] if id_map is not None else idx + offset).to(torch.int32)
+        c[:, :CAND] = vals
+        c[:, CAND:2 * CAND] = ids.view(torch.float32)
+        c[:, 2 * CAND:] = torch.logsumexp(lf, dim=-1, keepdim=True)
     w.comm.all_gather(c, b.cand_all[:b.world * R * (2 * CAND + 1)])
 
 

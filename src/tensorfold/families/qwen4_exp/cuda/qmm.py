@@ -261,7 +261,7 @@ _DEVICE = False
 def device_defaults() -> None:
     """Once, at the first launch (CUDA up by then): an RTX 30 card's measured shapes where no variable names one.
     sm_86 (8 RTX 3090s at TP 8): the HC down projection in 64 K slices of 160 inputs, a group a step, 2 warps,
-    10.8 us against 15.5 a launch at 1-7 rows."""
+    10.8 us against 15.5 a launch at 1-7 rows; the up projection and mix a program a stream."""
 
     global _DEVICE
     if _DEVICE:
@@ -276,6 +276,9 @@ def device_defaults() -> None:
     if sm86 and not os.environ.get("TF_HC_DOWN", "").strip():
         for shape in _HC_DOWN:
             SHAPES16[shape] = (64, 1, 2, 2, 64)
+    global UPMIX
+    if sm86 and not os.environ.get("TF_HC_UPMIX", "").strip():
+        UPMIX = (64, 2, 4, 2, 1)       # a program a stream: ~9 us against 13 (decode +2-8% in all four bench cells)
 
 
 def split_for(n: int, k: int) -> int:
@@ -535,6 +538,7 @@ def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tenso
 
     m, k = act.shape
     d = q.n // streams
+    device_defaults()
     db, gpi, warps, stages, split = UPMIX
     grid = (triton.cdiv(m, 16), d // db)
     if split:                          # a program a stream (4x the programs, a quarter of the steps), then the mix
