@@ -58,10 +58,10 @@ def _poll(ready: Callable[[], bool], what: str, timeout: float | None) -> None:
 class Ring:
     """Rank 0 -> ranks 1 .. world-1: message n in slot n % SLOTS, read once by every follower.
 
-    Rank 0 writes a slot's body, then its length, CRC and spill flag, then its sequence number; a follower reads
-    the sequence, then the rest, and takes the body once its CRC matches (on a weakly ordered host a read can see
-    the new sequence before the body: it reads again). Each follower's last read sequence, in the header, tells
-    rank 0 when a slot is free again."""
+    Rank 0 writes a slot's body, then its length, CRC (seeded with the sequence) and spill flag, then its sequence
+    number; a follower reads the sequence, then the rest, and takes the body once its CRC matches (on a weakly
+    ordered host a read can see the new sequence before the body, or the slot's last message: it reads again).
+    Each follower's last read sequence, in the header, tells rank 0 when a slot is free again."""
 
     def __init__(self, store, rank: int, world: int, *, tag: str = "ring", timeout: float = 600.0) -> None:
         self.store, self.rank, self.world, self.timeout = store, int(rank), int(world), float(timeout)
@@ -108,7 +108,7 @@ class Ring:
             for r in range(1, self.world):
                 self.store.set(f"{self.key}/spill/{seq}/{r}", bytes(data))
         self.mm[at + FIELDS:at + FIELDS + len(body)] = body
-        struct.pack_into("<qqq", self.mm, at + 8, len(body), zlib.crc32(body), int(spilled))
+        struct.pack_into("<qqq", self.mm, at + 8, len(body), zlib.crc32(body, seq & 0xFFFFFFFF), int(spilled))
         struct.pack_into("<q", self.mm, at, seq)        # last: a follower takes the slot once this lands
         self.seq = seq
 
@@ -121,7 +121,7 @@ class Ring:
             _poll(lambda: struct.unpack_from("<q", self.mm, at)[0] == seq, f"message {seq} from rank 0", None)
             length, crc, spilled = struct.unpack_from("<qqq", self.mm, at + 8)
             body = bytes(self.mm[at + FIELDS:at + FIELDS + length]) if 0 <= length <= SLOT - FIELDS else b""
-            if zlib.crc32(body) == crc and struct.unpack_from("<q", self.mm, at)[0] == seq:
+            if zlib.crc32(body, seq & 0xFFFFFFFF) == crc and struct.unpack_from("<q", self.mm, at)[0] == seq:
                 break
         if spilled:
             key = f"{self.key}/spill/{seq}/{self.rank}"
