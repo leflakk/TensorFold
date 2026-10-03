@@ -76,8 +76,11 @@ def bytes_in(arrays):
 @pytest.mark.parametrize("mtp", [False, True])
 @pytest.mark.parametrize("prefill_rows", [2048, 4096])
 @pytest.mark.parametrize("kv_dtype,bits", [("bf16", 16), ("int8", 8), ("int4", 4)])
+@pytest.mark.parametrize("twin", [True, False])
 def test_indexed_state_actual_kv_and_serial_twin_are_budgeted(monkeypatch, allocations, world, mtp, kv_dtype, bits,
-                                                            prefill_rows):
+                                                            prefill_rows, twin):
+    """The states a one-stream engine allocates fit its estimate: the drafting state, and the serial reference's
+    own (``twin``, TF_SERIAL_TWIN=1) or none (it then decodes in the drafting state)."""
     arrays, fake = allocations
     mod = importlib.import_module("tensorfold.families.qwen4_exp.cuda.state")
     gdn = importlib.import_module("tensorfold.families.qwen4_exp.cuda.gdn")
@@ -104,13 +107,18 @@ def test_indexed_state_actual_kv_and_serial_twin_are_budgeted(monkeypatch, alloc
         mod.Buffers(weights, 64, slots)
     mod.Buffers(weights, prefill_rows, slots, prefill=True)
     mod.State(weights, slots, 64, kv_dtype)
-    mod.State(weights, slots, 64, kv_dtype)  # the actual serial-reference twin constructor
+    if twin:
+        mod.State(weights, slots, 64, kv_dtype)  # the actual serial-reference twin constructor
     estimated = geometry.gdn_geometry(text, world, 7, indexed=True, mtp=mtp, kv_bits=bits,
-                                      prefill_rows=prefill_rows).bytes_at(slots)
+                                      prefill_rows=prefill_rows, twin=twin).bytes_at(slots)
     kv = [t for t in arrays if len(t.shape) == 3 and t.shape[:2] == (slots, cfg.kv_heads)]
-    caches = 2 * (2 + int(mtp))                                          # two states: two attention layers, the MTP's
+    caches = (1 + twin) * (2 + int(mtp))                                 # per state: two attention layers, the MTP's
     assert bytes_in(kv) == caches * 2 * slots * cfg.kv_heads * geometry.kv_bytes(cfg.head_dim, bits)
     assert bytes_in(arrays) <= estimated
+    if not twin:                                         # one state's caches less than with the twin
+        both = geometry.gdn_geometry(text, world, 7, indexed=True, mtp=mtp, kv_bits=bits,
+                                     prefill_rows=prefill_rows).bytes_at(slots)
+        assert both - estimated >= bytes_in(kv)
 
 
 def test_mla_latent_estimate_grows_by_the_cache_and_counts_one_prompt_chunk_scratch(monkeypatch):

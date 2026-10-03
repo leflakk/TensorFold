@@ -46,7 +46,7 @@ def test_quantized_caches_admit_longer_windows_on_the_same_budget(tmp_path, monk
     checkpoint(tmp_path, small_config(), WEIGHTS)
     calls, capacity = fake_runtime
     text = small_config()
-    bf16 = gdn_geometry(text, 1, 4, indexed=True, mtp=True, kept=KEEP_SERIAL + 1) if streams == 1 else \
+    bf16 = gdn_geometry(text, 1, 4, indexed=True, mtp=True, kept=KEEP_SERIAL + 1, twin=False) if streams == 1 else \
         indexed_stream_geometry(text, streams, 4, KEEP, mtp=True)
     budget = bf16.needed(12000) + 32768                      # bf16 fits about 12,000 tokens
     monkeypatch.setattr(capacity, "available_bytes", lambda t: budget)

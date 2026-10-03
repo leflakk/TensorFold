@@ -178,8 +178,9 @@ def live_kv(t: dict, world: int, window: int) -> int:
 
 def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mtp: bool = False,
                  kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False,
-                 kept: int = 2, prefill_rows: int = PREFILL_ROWS) -> Geometry:
-    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts."""
+                 kept: int = 2, prefill_rows: int = PREFILL_ROWS, twin: bool = True) -> Geometry:
+    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts;
+    ``twin`` (``indexed``): a second state of the whole window for the serial reference."""
 
     linear, attention = layer_counts(t)
     d, h = int(t["hidden_size"]), int(t["num_attention_heads"]) // world
@@ -212,9 +213,10 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
     row = kv_bytes(hd, kv_bits)
     def bytes_at(capacity: int) -> int:
         if indexed:
-            # Separate K/V arrays in both the main state and the lazy serial-reference twin.
-            cache = 4 * count * capacity * hk * row
-            cache += 2 * count * (capacity + (capacity + ratio - 1) // ratio) * index_dim * 2
+            # Separate K/V arrays in the main state, and in the lazy serial-reference twin when it has its own.
+            states = 2 if twin else 1
+            cache = 2 * states * count * capacity * hk * row
+            cache += states * count * (capacity + (capacity + ratio - 1) // ratio) * index_dim * 2
             # chunk partials cover the keys a row reads (at most the indexer budget and a block's tail)
             chunks = (min(capacity, budget + ratio - 1) + 511) // 512
             blocks = (capacity + ratio - 1) // ratio

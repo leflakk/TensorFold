@@ -121,12 +121,17 @@ class FlashNextEngine:
 
         paired = fast_partials(tp) and _os.environ.get("TF_PREFILL_OVERLAP", "1") != "0"
         prompt_rows = PREFILL_ROWS + (PREFILL_ROWS // 2 if paired else 0)
+        # one stream: the serial reference ("draft": false) decodes in the drafting state, so the window holds one
+        # set of caches; TF_SERIAL_TWIN=1 gives it a state of its own (the kept prompt states then survive it), at
+        # half the window
+        self.serial_twin = _os.environ.get("TF_SERIAL_TWIN", "0").strip() == "1"
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits,
                                                           world=tp, prefill_rows=prompt_rows))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
-                                               kept=KEEP_SERIAL + 1, prefill_rows=prompt_rows)))
+                                               kept=KEEP_SERIAL + 1, prefill_rows=prompt_rows,
+                                               twin=self.serial_twin)))
         if exl3:
             geometry = admission(geometry)
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
@@ -416,21 +421,26 @@ class FlashNextEngine:
 
     def _serial(self, prompt: list[int], max_tokens: int, sampling, on_tokens, constraint=None,
                 stop_eos: bool = True, probabilities=None) -> dict[str, Any]:
-        """One token a round from a fresh prefill in the serial engine's own state (no drafts, no kept states)."""
+        """One token a round from a fresh prefill (no drafts, no kept states): in the drafting engine's state, whose
+        kept prompt states go (the prefill overwrites their rows), or with TF_SERIAL_TWIN=1 in a state of its own."""
 
         import torch
 
         from .decode import prefill, serial_decode
 
-        if self.serial is None:
-            self.serial = self.e.twin()
+        if getattr(self, "serial_twin", False):
+            if self.serial is None:
+                self.serial = self.e.twin()
+            e = self.serial
+        else:
+            e, self.cache = self.e, []
         t0 = time.perf_counter()
-        first = prefill(self.serial, prompt, sampling, mtp=False, constraint=constraint, probabilities=probabilities)
+        first = prefill(e, prompt, sampling, mtp=False, constraint=constraint, probabilities=probabilities)
         torch.cuda.synchronize()
         stats: dict[str, Any] = {"prefill_s": round(time.perf_counter() - t0, 4), "cached": 0, "drafts": False}
         if (on_tokens is not None and on_tokens([first])) or (stop_eos and first in self.eos) or max_tokens <= 1:
             return stats
-        res = serial_decode(self.serial, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+        res = serial_decode(e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
                             constraint=constraint, probabilities=probabilities)
         stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, decode_tps=round(res.tokens_per_second, 2))
         return stats

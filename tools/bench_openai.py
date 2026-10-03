@@ -72,7 +72,9 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
             "decode_tps": (n - 1) / (last - first) if n and last > first else None, "text": "".join(text),
             # the engine's own clock: a round's time (kernel speed) and tokens a round (drafting), apart
             "ms_round": engine_s / rounds * 1e3 if rounds else None,
-            "tokens_round": (n - 1) / rounds if rounds and n else None}
+            "tokens_round": (n - 1) / rounds if rounds and n else None,
+            "prompt_tokens": int(usage["prompt_tokens"]) if usage and usage.get("prompt_tokens") is not None else None,
+            "prefill_s": (stats or {}).get("prefill_s"), "cached": (stats or {}).get("cached")}
 
 
 def together(base: str, model: str, item: dict, tokens: int, temperature: float, seeds: list, draft: bool,
