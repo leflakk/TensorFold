@@ -12,8 +12,10 @@ from .state import Buffers, State
 from .weights import Weights
 
 
-def mtp_stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int], torch.Tensor]]) -> list:
-    """Host work before an MTP step (next tokens, input streams); returns each stream's segment."""
+def mtp_stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int], torch.Tensor]],
+              lasts: Sequence[int] | None = None) -> list:
+    """Host work before an MTP step (next tokens, input streams); returns each stream's segment. ``lasts``: the row
+    whose draft-head logits each stream takes (default its segment's last; a padded window's last own row)."""
 
     segs: list = []
     for st, next_tokens, _ in windows:
@@ -25,7 +27,7 @@ def mtp_stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[in
     b.staged.synchronize()
     b.ids_host[:n].numpy()[:] = [int(t) for _, next_tokens, _ in windows for t in next_tokens]
     b.ids[:n].copy_(b.ids_host[:n], non_blocking=True)
-    b.last_host[:len(segs)].numpy()[:] = [a1 - 1 for _, _, a1 in segs]
+    b.last_host[:len(segs)].numpy()[:] = [a1 - 1 for _, _, a1 in segs] if lasts is None else list(lasts)
     b.last[:len(segs)].copy_(b.last_host[:len(segs)], non_blocking=True)
     for (_, _, streams), (_, a0, a1) in zip(windows, segs):
         if streams.data_ptr() != b.mtp_in[a0:a1].data_ptr():
@@ -35,8 +37,9 @@ def mtp_stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[in
 
 
 def mtp_compute(w: Weights, segs: Sequence, b: Buffers, *, last_only: bool = True,
-                context: int | None = None) -> torch.Tensor:
-    """The MTP head's GPU work (capturable); ``last_only``: the draft head's logits of each stream's last row."""
+                context: int | None = None, pick: bool = False) -> torch.Tensor:
+    """The MTP head's GPU work (capturable); ``last_only``: the draft head's logits of each stream's last row
+    (``pick``: of the row ``mtp_stage`` named for each stream, even alone: a padded window's last own row)."""
 
     c = w.cfg
     m = w.mtp
@@ -55,7 +58,7 @@ def mtp_compute(w: Weights, segs: Sequence, b: Buffers, *, last_only: bool = Tru
     k = len(segs)
     if b.prefill:                                # prefill buffers mix the last row into row 0: its logits only
         rows, xs, k = b.mixed[:1], b.xs_mixed[:1], 1
-    elif k == 1:
+    elif k == 1 and not pick:
         rows, xs = b.mixed[n - 1:n], b.xs_mixed[n - 1:n]
     else:
         rows = b.mixed.index_select(0, b.last[:k])

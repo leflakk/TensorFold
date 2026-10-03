@@ -234,7 +234,9 @@ class FlashNextEngine:
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         started = time.perf_counter()
         if self.concurrent:
-            self.multi.warm()
+            self.multi.warm()                       # with round graphs: each stream count's rounds captured
+            rounds = self.multi.rounds
+            captured = rounds.captures if rounds is not None and rounds.capture else 0
         else:
             from .decode import warm
 
@@ -252,7 +254,8 @@ class FlashNextEngine:
                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
-                 f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
+                 f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), "
+                 f"{'rounds in CUDA graphs' if captured else 'eager'}" if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
         if ple_on_ssd:
             how = "read from SSD at each lookup"

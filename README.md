@@ -9,7 +9,7 @@ tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 8 --parallel 4 
 
 See [docs/rtx3090.md](docs/rtx3090.md) for the format choice, the n-gram table placement, the tests to run first
 (`tools/fastcomm_check.py`) and the tuning variables. Status: experimental, under qualification on 8x RTX 3090
-(`--parallel` under `--tp`: new, not yet measured).
+(`--parallel` under `--tp`: rounds in CUDA graphs, being measured).
 
 ---
 

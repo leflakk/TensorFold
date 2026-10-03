@@ -515,6 +515,51 @@ def test_hc_readout_fused_gives_the_separate_kernels_bits(rows, inject):
         assert torch.equal(fused.inj, plain.inj)
 
 
+@pytest.mark.parametrize("rows", [17, 28, 64])
+def test_hc_readout_rows_keep_their_bits_past_16_rows(rows):
+    """A concurrent round past 16 rows (4 streams of 7) reads out each row as it reads it out alone: decode windows
+    take the fused read-out at any width (the separate kernels' 32-row tiles took other launch shapes)."""
+
+    from types import SimpleNamespace
+
+    from tensorfold.families.qwen4_exp.cuda import forward as fwd, glue
+    from tensorfold.families.qwen4_exp.cuda.weights import HC
+
+    qmm.device_defaults()
+    S, D, LOW = 4, 2560, 320
+    down = qmm.stack_q4([_mlx_weights(LOW, S * D, 5), _mlx_weights(S, S * D, 6)], "tiled")
+    hc = HC(down, qmm.make_q4(*_mlx_weights(S * D, LOW, 7), "tiled"),
+            1 + 0.05 * torch.randn((S * D,), generator=torch.Generator(device=DEV).manual_seed(8), device=DEV), True)
+    g = torch.Generator(device=DEV).manual_seed(rows)
+    h = (torch.randn((rows, S * D), generator=g, device=DEV) * 3).to(torch.bfloat16)
+
+    def readout(x):
+        m = x.shape[0]
+        f32, bf = torch.float32, torch.bfloat16
+        b = SimpleNamespace(pss=torch.empty((m, D // 256, S), dtype=f32, device=DEV),
+                            normed=torch.empty((m, S * D), dtype=bf, device=DEV),
+                            xs_normed=torch.empty((m, S * D // 32), dtype=f32, device=DEV),
+                            dn=torch.empty((m, LOW + S), dtype=bf, device=DEV),
+                            dn_mix=torch.empty((m, LOW), dtype=bf, device=DEV),
+                            act=torch.empty((m, LOW), dtype=bf, device=DEV),
+                            xs_act=torch.empty((m, LOW // 32), dtype=f32, device=DEV),
+                            up=torch.empty((m, S * D), dtype=bf, device=DEV),
+                            mixed=torch.empty((m, D), dtype=bf, device=DEV),
+                            xs_mixed=torch.empty((m, D // 32), dtype=f32, device=DEV),
+                            part=torch.empty((64 * max(m, 4) * 2560,), dtype=f32, device=DEV),
+                            inj=torch.empty((m, S), dtype=bf, device=DEV), prefill=False)
+        hh = x.clone()
+        glue.hc_writeback(hh, hh, b.pss, S, 0)
+        fwd._readout(hc, b, hh, m, 1e-6, S, LOW, b.inj)
+        return b.mixed, b.xs_mixed, b.inj
+
+    together = readout(h)
+    for r in range(rows):
+        alone = readout(h[r:r + 1])
+        for a, t in zip(alone, together):
+            assert torch.equal(a[0], t[r]), r
+
+
 def test_the_packaged_draft_vocabulary():
     """The MTP drafts' token ids: sorted, distinct, inside the vocabulary, every id below 65,536 and the
     tokenizer's added tokens among them."""

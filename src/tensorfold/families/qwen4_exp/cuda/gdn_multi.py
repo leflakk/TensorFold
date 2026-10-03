@@ -28,9 +28,12 @@ class Scratch:
 
 
 class Tables:
-    """A round's device tables: rows' streams and conv taps, layers' conv and state pointers, chains, pending rows."""
+    """A round's device tables: rows' streams and conv taps, layers' conv and state pointers, chains, pending rows.
+    ``static``: a captured round's device tables (``StaticTables``, one a window shape), refilled here; ``width``:
+    the pending rows a stream may hold (a captured round's fixed shape; default this round's most)."""
 
-    def __init__(self, w, scratch: Scratch, segs: Sequence, pending: Sequence[Sequence[int]]) -> None:
+    def __init__(self, w, scratch: Scratch, segs: Sequence, pending: Sequence[Sequence[int]], *, static=None,
+                 width: int | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         lin = scratch.lin
         taps = np.arange(4)[None, :]
@@ -41,7 +44,7 @@ class Tables:
             win[a0:a1] = np.where(j < 3, j, a0 + j)            # < 3: a conv state row, else window row tap - 3
             sid[a0:a1] = s
         entries, starts, slots, most = shared.plan_host([list(range(-1, a1 - a0 - 1)) for _, a0, a1 in segs])
-        width = max([len(rows_) for rows_ in pending] + [1])
+        width = max([len(rows_) for rows_ in pending] + [1]) if width is None else int(width)
         held = np.zeros((n, width), dtype=np.int32)             # each stream's last-round kept rows, not yet folded
         for s, rows_ in enumerate(pending):
             held[s, :len(rows_)] = rows_
@@ -53,8 +56,11 @@ class Tables:
                 ptrs[0, li, s] = st.conv[li].data_ptr()
                 ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
         dev = w.device
-        i32 = shared.to_device(ints.tolist(), torch.int32, dev)
-        i64 = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev)
+        if static is None:
+            i32 = shared.to_device(ints.tolist(), torch.int32, dev)
+            i64 = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev)
+        else:
+            i32, i64 = static.put("ints", ints.astype(np.int32)), static.put("ptrs", ptrs)
         self.sid, self.win = i32[:rows], i32[rows:5 * rows].view(rows, 4)
         at = 8 * rows + n + 1
         self.plan = shared.Plan(i32[5 * rows:8 * rows].view(rows, 3), i32[8 * rows:at], slots, most)

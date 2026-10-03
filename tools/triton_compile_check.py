@@ -5,7 +5,7 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-from tensorfold.families.qwen4_exp.cuda import glue, qmm, topk
+from tensorfold.families.qwen4_exp.cuda import attention, attn_multi, glue, qmm, topk
 
 CASES = [
     ("topk._block_top", topk._block_top,
@@ -37,6 +37,23 @@ CASES = [
       "RS": "i32", "D": "constexpr", "S": "constexpr", "MODE": "constexpr", "TOPK": "constexpr", "SLOTS": "constexpr",
       "BLOCK": "constexpr", "WORLD": "constexpr"},
      {"D": 2560, "S": 4, "MODE": 1, "TOPK": 1, "SLOTS": 1, "BLOCK": 256, "WORLD": 1}),
+    ("glue._ple_conv_multi", glue._ple_conv_multi,
+     {"GATED": "*bf16", "PSS": "*fp32", "NC": "*bf16", "TAILS": "*i64", "SID": "*i32", "POSR": "*i32",
+      "FIRST": "*i32", "CW": "*bf16", "H": "*bf16", "HOUT": "*bf16", "NROW": "*bf16", "eps": "fp32", "R": "i32",
+      "D": "constexpr", "S": "constexpr", "TAPS": "constexpr", "DIL": "constexpr", "BLOCK": "constexpr"},
+     {"D": 2560, "S": 4, "TAPS": 4, "DIL": 3, "BLOCK": 512}),
+    ("attn_multi._scores_multi", attn_multi._scores_multi,
+     {"IQ": "*bf16", "CP": "*i64", "POSR": "*i32", "SID": "*i32", "SC": "*fp32", "NB": "i32", "N": "i32",
+      "HI": "constexpr", "DI": "constexpr", "RATIO": "constexpr", "TOP": "constexpr", "BB": "constexpr"},
+     {"HI": 4, "DI": 128, "RATIO": 4, "TOP": 512, "BB": 64}),
+    ("attention._select(rowpos)", attention._select,
+     {"SC": "*fp32", "POS0": "*i32", "IDS": "*i32", "NKR": "*i32", "SPR": "*i32", "NB": "i32", "RATIO": "constexpr",
+      "TOP": "constexpr", "IDW": "constexpr", "BLOCK": "constexpr", "ROWPOS": "constexpr"},
+     {"RATIO": 4, "TOP": 512, "IDW": 2052, "BLOCK": 4096, "ROWPOS": True}),
+    ("attention._select_tiles(rowpos)", attention._select_tiles,
+     {"SC": "*fp32", "POS0": "*i32", "IDS": "*i32", "NKR": "*i32", "SPR": "*i32", "NB": "i32", "RATIO": "constexpr",
+      "TOP": "constexpr", "IDW": "constexpr", "TB": "constexpr", "ROWPOS": "constexpr"},
+     {"RATIO": 4, "TOP": 512, "IDW": 2052, "TB": 8192, "ROWPOS": True}),
 ]
 bad = 0
 for name, fn, sig, consts in CASES:

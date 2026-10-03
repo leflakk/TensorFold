@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Sequence
 
 import numpy as np
@@ -80,10 +79,36 @@ def _merge_multi(PO, PM, PL, POSR, OUT, NKR, H: tl.constexpr, HK: tl.constexpr, 
     _merge_row(PO, PM, PL, OUT, n, r, tl.program_id(1), H, HK, D, G, CH, NCH, BITS)
 
 
-class Step:
-    """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move."""
+@triton.jit
+def _scores_multi(IQ, CP, POSR, SID, SC, NB, N, HI: tl.constexpr, DI: tl.constexpr, RATIO: tl.constexpr,
+                  TOP: tl.constexpr, BB: tl.constexpr):
+    """``attention._scores`` for a window of several streams: row r's position and its stream's pooled blocks by
+    table (the same arithmetic: a row gets the bits of its stream's own launch)."""
 
-    def __init__(self, w, segs: Sequence, mtp: bool) -> None:
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    complete = (tl.load(POSR + r) + 1) // RATIO
+    if complete > TOP and j * BB < complete:
+        pooled = _ptr(CP + 5 * N, tl.load(SID + r), tl.bfloat16)
+        b = j * BB + tl.arange(0, BB)
+        ok = b < complete
+        d = tl.arange(0, DI)
+        k = tl.load(pooled + b[:, None].to(tl.int64) * DI + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+        total = tl.zeros((BB,), dtype=tl.float32)
+        for h in tl.static_range(HI):
+            q = tl.load(IQ + (r * HI + h) * DI + d).to(tl.float32)
+            total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
+        tl.store(SC + r * NB + b, total / tl.sqrt(DI * 1.0), mask=ok)
+
+
+class Step:
+    """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move.
+
+    ``static``: the device tables a captured step reads (``StaticTables``, one a window shape), refilled here;
+    ``context``: the keys launches cover (a captured step's bucket; default the longest stream's end). The main
+    model's step also lists each stream's n-gram tail (``tails``) for the window's one n-gram launch."""
+
+    def __init__(self, w, segs: Sequence, mtp: bool, *, static=None, context: int | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         layers = [l for l in w.layers if not l.linear] if not mtp else [w.mtp.layer]
         self.index = {layer.index: i for i, layer in enumerate(layers)}
@@ -104,16 +129,28 @@ class Step:
                 ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
                                  ikc.data_ptr(), pooled.data_ptr()]
         dev = w.device
-        ints = shared.to_device(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev)
-        self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
-        self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
-        self.ptrs = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev).view(len(layers), PTRS * n)
+        ints = np.concatenate([posr, sid, first, counts]).astype(np.int32)
+        tails = None if mtp else np.asarray([st.ple_tail.data_ptr() for st, _, _ in segs], dtype=np.int64)
+        if static is None:
+            ints_dev = shared.to_device(ints.tolist(), torch.int32, dev)
+            ptrs_dev = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev)
+            tails_dev = None if tails is None else shared.to_device(tails.tolist(), torch.int64, dev)
+        else:
+            ints_dev, ptrs_dev = static.put("ints", ints), static.put("ptrs", ptrs)
+            tails_dev = None if tails is None else static.put("tails", tails)
+        self.posr, self.sid = ints_dev[:rows], ints_dev[rows:2 * rows]
+        self.first, self.counts = ints_dev[2 * rows:2 * rows + n], ints_dev[2 * rows + n:]
+        self.ptrs = ptrs_dev.view(len(layers), PTRS * n)
+        self.tails = tails_dev
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
+        self.context = max(self.ends) if context is None else int(context)
         self.most = max(counts)
         self.vision = any(st.image_positions is not None for st, _, _ in segs)
         self.vision_ptrs = self.ptrs[0]
         if self.vision:
+            if static is not None:
+                raise ValueError("an image prompt's rows run eager (no captured step)")
             vp = [[st.image_positions.data_ptr() if st.image_positions is not None else st.pos_dev.data_ptr(),
                    st.rope_delta_dev.data_ptr(), 0 if st.image_positions is None else st.image_positions.shape[0]]
                   for st, _, _ in segs]
@@ -121,7 +158,8 @@ class Step:
 
 
 def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
-    """Every stream's ``layer`` attention: prep, pool, sparse streams' own selects, chunks, merge -> b.attn_o[:R]."""
+    """Every stream's ``layer`` attention: prep, pool, the sparse rows' selects, chunks, merge -> b.attn_o[:R]. One
+    launch a kernel for the whole window whatever its streams' lengths (a captured step's shape)."""
 
     c, a, sc = w.cfg, layer.attn, b.attn
     n, rows, cp = step.n, step.rows, step.ptrs[step.index[layer.index]]
@@ -144,11 +182,13 @@ def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
                                                     DI=c.index_dim, HALF=w.inv_freq.numel(), RATIO=sc.ratio,
                                                     VISION=step.vision, S1=sections[1], S2=sections[2],
                                                     num_warps=1)
-        for (st, a0, a1), end in zip(step.segs, step.ends):
-            if end // sc.ratio > top:                # this stream has sparse rows: its own select
-                _, _, pooled, pos, _ = _caches(layer, st, mtp)
-                attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0, context=end)
-    keys = max(step.ends)
+        # every row's select (a dense row keeps its length), its stream's position and pooled blocks by table
+        blocks = min(sc.nb, max(1, triton.cdiv(step.context, sc.ratio)))
+        _scores_multi[(rows, triton.cdiv(blocks, 64))](b.iq, cp, step.posr, step.sid, sc.scores, sc.nb, n,
+                                                       HI=c.index_heads, DI=c.index_dim, RATIO=sc.ratio, TOP=top,
+                                                       BB=64, num_warps=4)
+        attn_mod._launch_select(sc, step.posr, rows, blocks, rowpos=True, decode=True)
+    keys = step.context
     if sc.qsa:
         keys = min(keys, (top + 1) * sc.ratio - 1)
     chunks = min(sc.nch, triton.cdiv(keys, CHUNK))
@@ -161,17 +201,3 @@ def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
     _merge_multi[(rows, hk)](sc.po, sc.pm, sc.pl, step.posr, b.attn_o, sc.nk, H=c.heads, HK=hk, D=c.head_dim, G=g,
                              CH=CHUNK, NCH=sc.nch, QSA=sc.qsa, BITS=bits, RATIO=sc.ratio, TOP=top, num_warps=4)
     return b.attn_o[:rows]
-
-
-def _caches(layer, st, mtp: bool) -> tuple:
-    if mtp:
-        return st.mtp_kc, st.mtp_ikc, st.mtp_pooled, st.mtp_pos, st.mtp_len
-    ai = st.att_index[layer.index]
-    return st.kc[ai], st.ikc[ai], st.pooled[ai], st.pos_dev, st.pos
-
-
-def _rows_from(sc, a0: int) -> SimpleNamespace:
-    """The scratch as seen by a launch whose row 0 is window row ``a0``."""
-
-    return SimpleNamespace(ratio=sc.ratio, budget=sc.budget, nb=sc.nb, idw=sc.idw, scores=sc.scores[a0:],
-                           ids=sc.ids[a0:], nk=sc.nk[a0:], sparse=sc.sparse[a0:])

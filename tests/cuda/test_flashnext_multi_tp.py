@@ -2,7 +2,9 @@
 
 ``test_flashnext_tp_wide``'s checkpoint (the real expert width and heads) on 4 ranks. Streams decoded together emit
 each one's solo run on the one-stream engine, on every rank; then rank 0 serves them through a ``Scheduler`` and a
-``Leader`` while the other ranks replay its calls (``multi_tp.follow``), with a client that leaves mid-reply.
+``Leader`` while the other ranks replay its calls (``multi_tp.follow``), with a client that leaves mid-reply. Rounds
+run eager, with windows padded as captured rounds pad them (``graphs="pad"``) or not: these ranks' collectives sync
+the host, which a capture forbids (``test_flashnext_multi_graphs`` captures on one GPU).
 """
 
 import queue
@@ -82,11 +84,14 @@ def _solo(w, prompts, samplings) -> list[list[int]]:
     return out
 
 
-# (collectives, draft vocabulary, expert K splits, drafts a round): 4 streams of 6 rows take the split gate/up past
-# 16 rows (the 1024-wide test model takes none unless TF_EXPERT_SPLITS asks)
-@pytest.mark.parametrize("comm,vocab,splits,depth", [("fast", False, "", 3), ("fast", True, "4", 5),
-                                                     ("gather", False, "", 3)])
-def test_streams_decoded_together_on_ranks_equal_each_alone(checkpoint, monkeypatch, comm, vocab, splits, depth):
+# (collectives, draft vocabulary, expert K splits, drafts a round, padded windows): 4 streams of 6 rows take the
+# split gate/up past 16 rows (the 1024-wide test model takes none unless TF_EXPERT_SPLITS asks)
+@pytest.mark.parametrize("comm,vocab,splits,depth,graphs", [("fast", False, "", 3, "pad"),
+                                                            ("fast", True, "4", 5, "pad"),
+                                                            ("fast", False, "", 3, False),
+                                                            ("gather", False, "", 3, "pad")])
+def test_streams_decoded_together_on_ranks_equal_each_alone(checkpoint, monkeypatch, comm, vocab, splits, depth,
+                                                            graphs):
     monkeypatch.setenv("TF_EXPERT_SPLITS", splits)
     hub, ws = _ranks(checkpoint, comm, vocab)
     prompts = PROMPTS[:3] + [_long(70, 11)]                  # the last fills over five 16-row passes
@@ -94,8 +99,9 @@ def test_streams_decoded_together_on_ranks_equal_each_alone(checkpoint, monkeypa
     assert all(ref == refs[0] for ref in refs)               # every rank samples the same tokens
 
     def body(w):
-        dec = MultiDecoder(w, slots=4, capacity=1024, depth=depth, confidence=0.3, prefill_rows=16)
+        dec = MultiDecoder(w, slots=4, capacity=1024, depth=depth, confidence=0.3, prefill_rows=16, graphs=graphs)
         assert dec.tp and not dec.converged and dec.buf.moe.plan.split == (int(splits) if splits else 0)
+        assert (dec.rounds is not None) == bool(graphs) and (dec.rounds is None or not dec.rounds.capture)
         streams = [Stream(p, COUNT, smp, draft=i != 3, stop_eos=False)           # as serial_decode: past an end
                    for i, (p, smp) in enumerate(zip(prompts, SAMPLINGS))]
         dec.admit(streams[0])
@@ -143,7 +149,8 @@ def test_rank_zero_serves_and_the_others_replay_its_calls(checkpoint):
     refs = _threads(hub, [lambda w=w: _solo(w, prompts, samplings) for w in ws])
     assert all(ref == refs[0] for ref in refs)
     ring = _Queues(WORLD)
-    decoders = [MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, prefill_rows=16) for w in ws]
+    decoders = [MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, prefill_rows=16, graphs="pad")
+                for w in ws]
     replies: dict[int, list[int]] = {}
 
     def serve():

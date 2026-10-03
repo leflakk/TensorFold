@@ -247,11 +247,14 @@ def _scores(IQ, POOLED, POS0, SC, NB, HI: tl.constexpr, DI: tl.constexpr, RATIO:
 
 @triton.jit
 def _select(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
-            BLOCK: tl.constexpr):
-    """List each sparse row's TOP blocks in block order, breaking score ties by lower block id, followed by the unfinished tail; dense rows retain only their length."""
+            BLOCK: tl.constexpr, ROWPOS: tl.constexpr = False):
+    """List each sparse row's TOP blocks in block order, breaking score ties by lower block id, followed by the unfinished tail; dense rows retain only their length. ``ROWPOS``: POS0 holds each row's own position (rows of several streams)."""
 
     r = tl.program_id(0)
-    end = tl.load(POS0) + r + 1
+    if ROWPOS:
+        end = tl.load(POS0 + r) + 1
+    else:
+        end = tl.load(POS0) + r + 1
     complete = end // RATIO
     if complete <= TOP:
         tl.store(NKR + r, end)
@@ -300,11 +303,14 @@ def _block_keys(ROW, b, ok):
 
 @triton.jit
 def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
-                  TB: tl.constexpr):
+                  TB: tl.constexpr, ROWPOS: tl.constexpr = False):
     """``_select``'s lists for rows with more blocks than its registers hold, reading the row in TB-block tiles: the same cut (the TOP-th largest key) by radix select, one byte a pass from the top, then the same blocks placed tile by tile."""
 
     r = tl.program_id(0)
-    end = tl.load(POS0) + r + 1
+    if ROWPOS:
+        end = tl.load(POS0 + r) + 1
+    else:
+        end = tl.load(POS0) + r + 1
     complete = end // RATIO
     if complete <= TOP:
         tl.store(NKR + r, end)
@@ -355,18 +361,20 @@ def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.cons
         tl.store(SPR + r, 1)
 
 
-def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int) -> None:
-    """List each row's blocks from ``scratch.scores``: ``_select`` while ``blocks`` fit its registers, ``_select_tiles`` (the same lists) past them."""
+def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int, *, rowpos: bool = False,
+                   decode: bool | None = None) -> None:
+    """List each row's blocks from ``scratch.scores``: ``_select`` while ``blocks`` fit its registers, ``_select_tiles`` (the same lists) past them. ``rowpos``: ``pos0`` holds each row's position; ``decode``: a decode window's tiles (default: under 64 rows)."""
 
     top = scratch.budget // scratch.ratio
     width = triton.next_power_of_2(blocks)
     if width <= SELECT_REGS:
         _select[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
-                         RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, num_warps=16)
+                         RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, ROWPOS=rowpos, num_warps=16)
         return
-    tb, warps = (4096, 8) if rows >= 64 else (8192, 16)      # a prompt's row blocks, a decode window
+    decode = rows < 64 if decode is None else decode
+    tb, warps = (8192, 16) if decode else (4096, 8)          # a decode window, a prompt's row blocks
     _select_tiles[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
-                           RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, TB=tb, num_warps=warps)
+                           RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, TB=tb, ROWPOS=rowpos, num_warps=warps)
 
 
 def qsa_select(iq: torch.Tensor, ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
