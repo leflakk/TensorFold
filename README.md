@@ -3,11 +3,13 @@
 This branch adds RTX 30 (sm_86) support and Qwen3.8 Flash Next on 4 or 8 GPUs of one host:
 
 ```bash
-tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 8 --host 0.0.0.0   # one process a GPU
+tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 8 --host 0.0.0.0              # one process a GPU
+tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP --tp 8 --parallel 4 --host 0.0.0.0  # 4 requests at once
 ```
 
 See [docs/rtx3090.md](docs/rtx3090.md) for the format choice, the n-gram table placement, the tests to run first
-(`tools/fastcomm_check.py`) and the tuning variables. Status: experimental, under qualification on 8x RTX 3090.
+(`tools/fastcomm_check.py`) and the tuning variables. Status: experimental, under qualification on 8x RTX 3090
+(`--parallel` under `--tp`: new, not yet measured).
 
 ---
 

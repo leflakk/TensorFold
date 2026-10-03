@@ -63,22 +63,24 @@ class FlashNextEngine:
 
         if tp not in WORLDS or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on {', '.join(map(str, WORLDS))} GPUs")
-        if streams > 1 and tp > 1:
-            raise ValueError(f"--parallel decodes several Flash Next requests together on one GPU; with --tp {tp} it "
-                             "serves one request at a time for now, so drop --parallel")
+        import os
+
+        if streams > 1 and tp > 1 and os.environ.get("TF_LOCAL_RANKS") != "1":
+            raise ValueError(f"--parallel with --tp {tp} runs every rank on this host (rank 0 sends each round's "
+                             f"plan through shared memory): start `tensorfold serve MODEL --tp {tp} --parallel "
+                             f"{streams}` without --master")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError(f"MTP draft confidence: a probability from 0 to 1, not {confidence}")
         torch.cuda.set_device(0)
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
+        self.streams = int(streams)
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
         ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
         if tp > 1:
-            import os
-
             from tensorfold.cuda.comm import NCCL
 
             if not master:
@@ -98,7 +100,8 @@ class FlashNextEngine:
         paired = fast_partials(tp) and _os.environ.get("TF_PREFILL_OVERLAP", "1") != "0"
         prompt_rows = PREFILL_ROWS + (PREFILL_ROWS // 2 if paired else 0)
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
-        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
+        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits,
+                                                          world=tp))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
                                                kept=KEEP_SERIAL + 1, prefill_rows=prompt_rows)))
@@ -186,7 +189,7 @@ class FlashNextEngine:
                   f"workspace reserved{'; https URLs allowed' if vision_urls else ''}", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
-        self.multi = self.scheduler = None
+        self.multi = self.scheduler = self.leader = self.ring = None
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
 
@@ -197,9 +200,18 @@ class FlashNextEngine:
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace)
-            self.scheduler = Scheduler(self.multi, max_streams=streams)
+            decoder = self.multi
+            if tp > 1:                       # rank 0 decides each call; every rank runs it (``multi_tp``)
+                from .multi_tp import Leader, Ring
+
+                self.ring = Ring(self.comm.store, rank, tp)
+                decoder = self.leader = Leader(self.multi, self.ring) if rank == 0 else None
+            if decoder is not None:
+                self.scheduler = Scheduler(decoder, max_streams=streams)
         else:
-            self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+            # TF_GRAPHS=0: eager windows (how much CUDA graphs save a round, next to concurrent rounds, which run eager)
+            self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1),
+                            graphs=graphs and os.environ.get("TF_GRAPHS", "1") != "0",
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
         started = time.perf_counter()
         locked = False
@@ -265,7 +277,8 @@ class FlashNextEngine:
         partials = 2 * (decode_partials() == "bf16") + (prefill_partials() == "bf16")     # every rank sends alike
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype], partials,
-                             int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
+                             int(getattr(self, "streams", 1)), int(prompt_precision.fp8())], dtype=torch.int64,
+                            device="cuda")
         world = getattr(self.comm, "world", None) or getattr(self, "tp", 2)
         every = torch.empty((world * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, every)
@@ -274,8 +287,8 @@ class FlashNextEngine:
             prompt_precision.same_on_ranks(int(every[0, -1]), int(every[r, -1]))
             if not torch.equal(every[0], every[r]):
                 raise RuntimeError(f"the ranks were started with different settings (drafts, confidence, context, "
-                                   f"draft vocabulary, KV cache, TF_*_PARTIALS): rank 0 {every[0].tolist()}, rank {r} "
-                                   f"{every[r].tolist()}")
+                                   f"draft vocabulary, KV cache, TF_*_PARTIALS, --parallel): rank 0 "
+                                   f"{every[0].tolist()}, rank {r} {every[r].tolist()}")
 
     def _key(self, n: int) -> str:
         return f"tensorfold/flashnext/request/{n}"
@@ -284,6 +297,9 @@ class FlashNextEngine:
         """Rank 0: tell the other ranks to leave ``follow``."""
 
         if self.tp > 1 and self.rank == 0:
+            if getattr(self, "leader", None) is not None:
+                self.leader.stop()
+                return
             for r in range(1, self.tp):
                 self.comm.store.set(f"{self._key(self.served)}/{r}", json.dumps({"stop": True}))
 
@@ -435,6 +451,8 @@ class FlashNextEngine:
         if self.scheduler is not None:
             self.scheduler.close()
             self.scheduler = None
+        if getattr(self, "leader", None) is not None:      # tensor parallel: the followers leave ``follow``
+            self.leader.stop()
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
@@ -481,6 +499,14 @@ class FlashNextEngine:
     def follow(self) -> None:
         """Rank 1: decode every request rank 0 serves, until rank 0 stops."""
 
+        if getattr(self, "multi", None) is not None:       # --parallel: replay rank 0's calls (``multi_tp``)
+            from tensorfold.engine import grammar
+
+            from .multi_tp import follow
+
+            follow(self.multi, self.ring,
+                   lambda packed: grammar.compiler(self, self.model_dir, self.eos).follow(packed))
+            return
         while True:
             request = self._receive()
             if request is None:

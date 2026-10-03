@@ -81,30 +81,45 @@ def tp_sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], s
     return chosen, probs
 
 
-def choose_gathered(w: Weights, cand_all: torch.Tensor, R: int, positions: Sequence[int], sampling: Sampling | None,
-                    with_prob: bool = False):
-    """Apply keyed sampling to candidates gathered inside the step graph; ``with_prob`` also returns each selected token's probability."""
+def gathered_host(w: Weights, cand_all: torch.Tensor, R: int) -> tuple:
+    """A step's gathered candidates read back once: every rank's values [R, world CAND] (fp32), their global ids
+    (int64) and each row's log-sum-exp over every rank's shard (float64)."""
 
     world, width = int(w.meta["world"]), 2 * CAND + 1
     g = cand_all[:world * R * width].view(world, R, width).cpu().numpy()
     values = np.concatenate([g[r, :, :CAND] for r in range(world)], axis=1).astype(np.float32)
     tokens = np.concatenate([np.ascontiguousarray(g[r, :, CAND:2 * CAND]).view(np.int32) for r in range(world)],
                             axis=1).astype(np.int64)
+    lse = g[:, :, 2 * CAND].astype(np.float64)
+    top = lse.max(axis=0)
+    return values, tokens, top + np.log(np.exp(lse - top).sum(axis=0))
+
+
+def choose_host(host: tuple, a0: int, a1: int, positions: Sequence[int], sampling: Sampling | None,
+                with_prob: bool = False):
+    """Keyed sampling of rows [a0, a1) of ``gathered_host``'s candidates; ``with_prob`` also returns each selected
+    token's temperature-1 probability."""
+
+    values, tokens, total = host[0][a0:a1], host[1][a0:a1], host[2][a0:a1]
     if sampling is None or sampling.temperature <= 0:
         order = np.lexsort((tokens, -values), axis=-1)
-        chosen = [int(tokens[i, order[i, 0]]) for i in range(R)]
+        chosen = [int(tokens[i, order[i, 0]]) for i in range(a1 - a0)]
     else:
         chosen = choose_rows(values, tokens, positions, sampling)
     if not with_prob:
         return chosen
-    lse = g[:, :, 2 * CAND].astype(np.float64)
-    top = lse.max(axis=0)
-    total = top + np.log(np.exp(lse - top).sum(axis=0))
     probs = []
     for i, t in enumerate(chosen):
         hit = np.nonzero(tokens[i] == t)[0]
         probs.append(float(np.exp(float(values[i, hit[0]]) - total[i])) if len(hit) else 0.0)
     return chosen, probs
+
+
+def choose_gathered(w: Weights, cand_all: torch.Tensor, R: int, positions: Sequence[int], sampling: Sampling | None,
+                    with_prob: bool = False):
+    """Apply keyed sampling to candidates gathered inside the step graph; ``with_prob`` also returns each selected token's probability."""
+
+    return choose_host(gathered_host(w, cand_all, R), 0, R, positions, sampling, with_prob)
 
 
 def _gathered_fits(sampling: Sampling | None) -> bool:
@@ -486,6 +501,9 @@ class _Profile:
         self.counts[phase] = self.counts.get(phase, 0) + count
         self.last = now
 
+    def count(self, name: str, n: int) -> None:
+        self.counts[name] = self.counts.get(name, 0) + n
+
     def round(self) -> None:
         self.rounds += 1
         if self.rounds % self.every:
@@ -493,9 +511,10 @@ class _Profile:
         n = self.rounds
         total = sum(self.seconds.values())
         parts = ", ".join(f"{k} {v / n * 1e3:.2f} ms" for k, v in self.seconds.items())
+        streams = f"streams {self.counts['streams'] / n:.2f}, " if "streams" in self.counts else ""
         print(f"[tensorfold] decode profile over {n} rounds: {total / n * 1e3:.2f} ms a round ({parts}); "
-              f"drafts {self.counts.get('draft', 0) / n:.2f}, verify rows {self.counts.get('verify', 0) / n:.2f}, "
-              f"kept {self.counts.get('commit', 0) / n:.2f} a round", flush=True)
+              f"{streams}drafts {self.counts.get('draft', 0) / n:.2f}, verify rows "
+              f"{self.counts.get('verify', 0) / n:.2f}, kept {self.counts.get('commit', 0) / n:.2f} a round", flush=True)
 
 
 _PROFILE: _Profile | None = None

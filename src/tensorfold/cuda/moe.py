@@ -118,6 +118,9 @@ def _topk_rows(L, PICK, WTS, NE: tl.constexpr, NL: tl.constexpr, TOPK: tl.conste
     tl.store(WTS + r * SLOTS + ak, w, mask=ak < SLOTS)
 
 
+SPLIT_ROWS = 64          # the widest window whose gate/up may take K splits (tensor-parallel decode windows)
+
+
 class MoEBuffers:
     """Static scratch for up to ``rows`` rows (CUDA-graph safe); ``prefill`` picks the experts' prefill arithmetic."""
 
@@ -128,7 +131,9 @@ class MoEBuffers:
         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=device)
         self.wts = torch.empty((rows, slots), dtype=torch.float32, device=device)
         self.plan = grouped.Plan(rows, slots, cfg.num_experts + 1, device, prefill=prefill)
-        if prefill and split > 1 and rows <= grouped.TILE:      # decode windows: one pair an expert a row, 16 at most
+        # decode windows (a concurrent round's: 4 streams of 16 rows at most): the split items hold 16 pairs, an
+        # expert with more takes more items; prompt buffers (``split`` 0) keep the unsplit kernel
+        if prefill and split > 1 and rows <= SPLIT_ROWS:
             self.plan.split = int(split)
             self.plan.part = torch.empty((split * rows * slots * 2 * cfg.moe_intermediate_size,), dtype=torch.float32,
                                          device=device)

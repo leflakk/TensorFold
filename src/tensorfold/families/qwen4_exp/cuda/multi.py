@@ -1,4 +1,5 @@
-"""Flash Next's concurrent rounds on one GPU: every stream keeps exactly its own accepted prefix."""
+"""Flash Next's concurrent rounds on one GPU or tensor-parallel ranks: every stream keeps exactly its own accepted
+prefix."""
 
 from __future__ import annotations
 
@@ -11,13 +12,14 @@ from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.markers import MIN_GAP
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda.memory_gate import AgreedGate, MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
+from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _Profile, _gathered_fits, choose_host, draft, entry_end,
+                     gathered_host, prefill_begin, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
@@ -32,6 +34,20 @@ PASS_MIN = 128                   # the fewest prompt rows a round's pass takes
 FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
 
 
+def _agree(w):
+    """Tensor parallel: every rank's verdict -> True only if each rank's is (one small gather on every rank)."""
+
+    world, device = int(w.meta["world"]), w.device
+
+    def agree(ok: bool) -> bool:
+        mine = torch.tensor([int(bool(ok))], dtype=torch.int64, device=device)
+        every = torch.empty((world,), dtype=torch.int64, device=device)
+        w.comm.all_gather(mine, every)
+        return bool(int(every.min()))
+
+    return agree
+
+
 def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
     """A one-sequence engine over a slot's state and the shared buffers (eager: no CUDA graphs)."""
 
@@ -43,13 +59,23 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
 
 
 class MultiDecoder:
-    """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
+    """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context.
+
+    Tensor parallel (``w.comm``): every rank runs this decoder on the same calls in the same order (rank 0 decides
+    them, ``multi_tp``), so each rank takes the same rounds, passes and growth: rows sample from every rank's
+    gathered candidates, the memory gate's answers are agreed by all ranks, and a call fills at most one prompt
+    pass (a request waiting to be admitted is rank 0's to see, between calls)."""
+
+    tp = False                                       # tensor parallel (``w.comm``)
+    planned: int | None = None                       # tensor parallel: the pass rows rank 0 chose for this round
+    clock = False                                    # rank 0 of tensor-parallel ranks: times passes alone (share)
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0) -> None:
-        if w.comm is not None:
-            raise ValueError("concurrent Flash Next runs on one GPU for now")
+        self.tp = w.comm is not None
+        if self.tp and vision is not None:
+            raise ValueError("image input on Flash Next runs on one GPU")
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
         self.points = points                         # a prompt's message starts to keep states at, or None
         self.vision = vision
@@ -60,7 +86,8 @@ class MultiDecoder:
         # rounds beside a filling prompt size its pass so decoding keeps ``share`` of the pass's time (0: whole passes)
         self.share, self.round_s, self.row_s = share, None, None
         self.buf = Buffers(w, rows, capacity, moe_prefill=True)
-        self.mbuf = Buffers(w, rows, capacity) if w.mtp is not None else None
+        # tensor parallel: the MTP head's experts take the split prefill form, as the one-stream engine's do
+        self.mbuf = Buffers(w, rows, capacity, moe_prefill=True if self.tp else None) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
@@ -71,8 +98,9 @@ class MultiDecoder:
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
-        self.memory_gate = MemoryGate(live() if live is not None else 1 << 62,
-                                      reserve=max(2 * GIB, workspace_bytes), live=live)
+        room, reserve = live() if live is not None else 1 << 62, max(2 * GIB, workspace_bytes)
+        self.memory_gate = (AgreedGate(room, reserve, live, agree=_agree(w)) if self.tp else
+                            MemoryGate(room, reserve=reserve, live=live))
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
         self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
@@ -175,9 +203,12 @@ class MultiDecoder:
 
         s = Stream([0] * min(self.prefill_rows + WARM_TAIL + 1, self.capacity - self.depth - 2), 2)
         self.admit(s)
-        if not s.done:
-            self.round()                                 # the whole prompt (nothing else decodes), then a round
+        for _ in range(64):                              # the whole prompt (nothing else decodes), then a round
+            if not any(x is s for x in self.filling) and (s.done or s.sid not in self.streams):
+                break
+            self.round()                                 # tensor parallel: a pass a call
         self.streams.pop(s.sid, None)
+        self.held.pop(s.sid, None)
         self._drop_kept(s.st)
         self._shrink(s.st)
         if all(f is not s.st for f in self.free):
@@ -225,13 +256,15 @@ class MultiDecoder:
         ended: list[Stream] = []
         while self.filling:
             ended += self._pass()
-            if any(not x.done and not x.waiting for x in self.streams.values()) or self.arrived():
-                break
+            if self.tp or any(not x.done and not x.waiting for x in self.streams.values()) or self.arrived():
+                break                                    # tensor parallel: rank 0 sees arrivals between calls
         return ended
 
     def _pass_rows(self) -> int:
         """A round's prompt rows: its decode (a round alone) takes ``share`` of the pass's time, by the last rounds."""
 
+        if self.planned is not None:                     # tensor parallel: rank 0's choice, on every rank
+            return self.planned
         live = any(not s.done for s in self.streams.values())
         return pass_limit(self.prefill_rows, live, self.share, self.round_s, self.row_s, PASS_MIN)
 
@@ -281,7 +314,14 @@ class MultiDecoder:
             heads = logits[:len(ends)].clone() if ends else None
             lasts = self._absorb(pieces, segs, cuts)
         except Exception as exc:                         # noqa: BLE001  (these requests fail, the others go on)
+            if self.tp:                                  # a rank's own failure: the ranks are no longer in step
+                raise
             return self._failed(pieces, exc)
+        rows = sum(n for _, _, n in pieces)
+        if self.clock and rows:                          # a pass alone: what a prompt row costs (--decode-share)
+            torch.cuda.synchronize()
+            per = (time.perf_counter() - t0) / rows
+            self.row_s = per if self.row_s is None else 0.7 * self.row_s + 0.3 * per
         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces))
 
     def _note_passed(self, pieces) -> None:
@@ -422,6 +462,7 @@ class MultiDecoder:
         live = [s for s in live if not s.done]
         if not live:
             return failed + ended
+        prof = _Profile.make(self.w)                     # TF_PROFILE_DECODE=N: where rounds' time goes (rank 0)
         t0 = time.perf_counter()
         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
         segs = stage(self.w, self.buf, windows)
@@ -439,6 +480,8 @@ class MultiDecoder:
         held = [self.held.pop(s.sid, []) for s in live]
         tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
         self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
+        if prof:
+            prof.mark("host")
         try:
             if pieces:                                 # the window and the pass: each layer's experts once for both
                 pends = self._end_rows(pieces, psegs)
@@ -448,15 +491,24 @@ class MultiDecoder:
                 logits = compute(self.w, segs, self.buf)
         finally:
             self.buf.gdn_tables = self.buf.attn_step = None
+        if prof:
+            prof.mark("verify", segs[-1][2])
+            prof.count("streams", len(live))
         lasts = self._absorb(pieces, psegs, cuts) if pieces else None
         starts = [a0 for _, a0, _ in segs] + [segs[-1][2]]
+        offset = int(self.w.meta.get("vocab_offset", 0))                # tensor parallel: this rank's columns
         for s, (_, a0, a1) in zip(live, segs):
             if s.sid in grammars:
-                s.constraint.mask(logits[a0:a1], grammars[s.sid])
+                s.constraint.mask(logits[a0:a1], grammars[s.sid], offset)
         positions = [[st.pos + 1 + r for r in range(a1 - a0)] for st, a0, a1 in segs]
-        sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
+        if self.tp:
+            sampled = self._tp_sample(logits, starts, positions, live, grammars)
+        else:
+            sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
         paths = [accept(tokens, list(range(-1, len(tokens) - 1)), rows, s.count - len(s.out), self._ends(s))
                  for s, (_, tokens), rows in zip(live, windows, sampled)]
+        if prof:
+            prof.mark("sample")
         for s, (_, tokens), (_, a0, _), (path, end), pos in zip(live, windows, segs, paths, positions):
             if s.probabilities is not None:
                 capture(logits, [tokens[r] for r in path[1:]] + [end], [pos[r] for r in path],
@@ -476,7 +528,12 @@ class MultiDecoder:
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
             kept.append((s, a0, rows[:len(path)], new, last))
+        if prof:
+            prof.mark("commit", sum(len(path) for path, _ in paths))
         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
+        if prof:
+            prof.mark("draft", sum(len(s.drafts) for s, _, _, _, last in kept if s.draft and not last))
+            prof.round()
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -531,6 +588,24 @@ class MultiDecoder:
                 s.st.mtp_drafted += 1
             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
 
+    def _tp_sample(self, logits: torch.Tensor, starts: list[int], positions: list, live: list,
+                   masked) -> list[list[int]]:
+        """Tensor parallel: each stream's rows from every rank's candidates, gathered in the forward (one read-back);
+        a grammar's masked rows, or a sampler they don't cover, draw over the masked shards with a gather of their
+        own (every rank takes the same ones, in order)."""
+
+        w, host, out = self.w, None, []
+        for i, s in enumerate(live):
+            a0, a1 = starts[i], starts[i + 1]
+            if s.sid in masked or not _gathered_fits(s.sampling):
+                out.append(tp_sample_rows(w, logits[a0:a1], positions[i], s.sampling,
+                                          offset=int(w.meta["vocab_offset"])))
+                continue
+            if host is None:
+                host = gathered_host(w, self.buf.cand_all, starts[-1])
+            out.append(choose_host(host, a0, a1, positions[i], s.sampling))
+        return out
+
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
 
@@ -543,6 +618,8 @@ class MultiDecoder:
     def _picks(self, logits: torch.Tensor, positions: list[int], samplings: list) -> list[tuple[int, float]]:
         """Each row's keyed draft and its probability at temperature 1, one read-back (drafts change speed only)."""
 
+        if self.tp:
+            return self._tp_picks(logits, positions, samplings)
         row = logits.float()
         k = max([int(s.top_k) + MARGIN for s in samplings if s is not None and s.temperature > 0 and s.top_k] or [1])
         k = min(k, row.shape[1])
@@ -566,11 +643,28 @@ class MultiDecoder:
             out.append((int(tok), float(np.exp(float(g[hit[0]]) - lse_i)) if len(hit) else 0.0))
         return out
 
+    def _tp_picks(self, logits: torch.Tensor, positions: list[int], samplings: list) -> list[tuple[int, float]]:
+        """``_picks`` from every rank's draft candidates, gathered in the MTP step (``mbuf.cand_all``, one read-back);
+        a sampler they don't cover draws over the shards with its own gather."""
+
+        w, host, out = self.w, None, []
+        for i, (pos, smp) in enumerate(zip(positions, samplings)):
+            if not _gathered_fits(smp):
+                toks, probs = tp_sample_rows(w, logits[i:i + 1], [pos], smp, offset=int(w.meta["vocab_offset"]),
+                                             id_map=w.draft_ids, with_prob=True)
+            else:
+                if host is None:
+                    host = gathered_host(w, self.mbuf.cand_all, len(positions))
+                toks, probs = choose_host(host, i, i + 1, [pos], smp, with_prob=True)
+            out.append((int(toks[0]), float(probs[0])))
+        return out
+
     def finish(self, done: list[Stream]) -> None:
         """Drop finished streams; a slot whose prompt state is kept stays with it, the rest are free again."""
 
         for s in done:
             self.streams.pop(s.sid, None)
+            self.held.pop(s.sid, None)                   # a stream that ended outside a round (a yield, a stop)
             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
                 self._shrink(s.st)
                 self.free.append(s.st)
