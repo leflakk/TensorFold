@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -78,7 +79,28 @@ class NGram:
     def ids(self, history: np.ndarray, tokens: np.ndarray) -> np.ndarray:
         """Row ids [L, heads] for ``tokens`` [L] after ``history`` [n-1] (EOS resets the n-grams)."""
 
-        seq = np.concatenate([np.asarray(history, dtype=np.int64), np.asarray(tokens, dtype=np.int64)])[None]
+        seq = np.concatenate([np.asarray(history, dtype=np.int64), np.asarray(tokens, dtype=np.int64)])
+        return self._ids(seq)[-len(tokens):]
+
+    def ids_many(self, pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+        """``ids`` of several (history, tokens), their rows one after another, in one lookup: the sequences laid end
+        to end, each after its own history. A history as long as the n-grams' context keeps every n-gram within its
+        own sequence (an EOS before it then cuts none of them), so each row is the one ``ids`` gives."""
+
+        if len(pairs) == 1 or any(len(history) < self.context for history, _ in pairs):
+            return np.concatenate([self.ids(history, tokens) for history, tokens in pairs])
+        parts, rows, at = [], [], 0
+        for history, tokens in pairs:
+            h, t = np.asarray(history, dtype=np.int64), np.asarray(tokens, dtype=np.int64)
+            parts += [h, t]
+            rows.append(np.arange(at + len(h), at + len(h) + len(t)))
+            at += len(h) + len(t)
+        return self._ids(np.concatenate(parts))[np.concatenate(rows)]
+
+    def _ids(self, seq: np.ndarray) -> np.ndarray:
+        """Row ids [len(seq), heads] of every position of ``seq``."""
+
+        seq = seq[None]
         batch, width = seq.shape
         pos = np.arange(width)
         eos_at = np.where(seq == self.eos, pos[None], -1)
@@ -98,8 +120,7 @@ class NGram:
                     mixed = np.bitwise_xor(mixed, shifted[p] * self.multipliers[p])
                 sizes = self.head_sizes[first:first + self.per_ngram]
                 blocks.append(mixed[..., None] % sizes + self.head_offsets[first:first + self.per_ngram])
-        out = np.concatenate(blocks, axis=-1)[0, -len(tokens):]
-        return out
+        return np.concatenate(blocks, axis=-1)[0]
 
     def initial_history(self) -> np.ndarray:
         return np.full((self.context,), self.eos, dtype=np.int64)

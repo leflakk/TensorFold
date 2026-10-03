@@ -38,13 +38,13 @@ def test_parallel_ranks_cut_by_stream_count_unless_one_cut_is_asked(tmp_path, mo
     ranks = dict(tp=8, master="127.0.0.1")
     assert qwen4_exp.cuda_engine(tmp_path).confidence == 0.7                       # one GPU, one stream
     assert qwen4_exp.cuda_engine(tmp_path, parallel=4).confidence == 0.7           # one GPU: one cut for any count
-    assert qwen4_exp.cuda_engine(tmp_path, **ranks).confidence == 0.3              # the one-stream engine on 8 ranks
+    assert qwen4_exp.cuda_engine(tmp_path, **ranks).confidence == 0.5              # the one-stream engine on 8 ranks
     assert qwen4_exp.cuda_engine(tmp_path, parallel=4, **ranks).confidence == (0.5, 0.6, 0.7)
     assert qwen4_exp.cuda_engine(tmp_path, parallel=4, mtp_confidence=0.4, **ranks).confidence == 0.4
     monkeypatch.setenv("TF_MULTI_CONFIDENCE", "0.4,0.8")
     assert qwen4_exp.cuda_engine(tmp_path, parallel=4, **ranks).confidence == (0.4, 0.8)
     assert qwen4_exp.cuda_engine(tmp_path, parallel=4, mtp_confidence=0.6, **ranks).confidence == 0.6
-    assert qwen4_exp.cuda_engine(tmp_path, **ranks).confidence == 0.3              # --parallel's only
+    assert qwen4_exp.cuda_engine(tmp_path, **ranks).confidence == 0.5              # --parallel's only
 
 
 @pytest.mark.torch

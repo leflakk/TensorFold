@@ -546,16 +546,17 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
     for layer in w.layers:
         if layer.ple is not None:
             p = layer.ple
-            for (st, tokens), (_, a0, _) in zip(windows, segs):
-                toks = np.asarray(tokens, dtype=np.int64)
-                ids = p.ngram.ids(st.ple_history, toks)
-                st.ple_last = (st.ple_history, toks)
-                if w.x3 is not None:
-                    from .exl3_pack import stage_ple
+            pairs = [(st.ple_history, np.asarray(tokens, dtype=np.int64)) for st, tokens in windows]
+            for (st, _), pair in zip(windows, pairs):
+                st.ple_last = pair
+            # every window's rows in one lookup and one gather: their staging rows follow each other from row 0
+            ids = p.ngram.ids_many(pairs)                                             # ids [rows, heads]
+            if w.x3 is not None:
+                from .exl3_pack import stage_ple
 
-                    stage_ple(p.table, w.x3, ids, at=a0 * (ids.size // len(toks)))
-                else:
-                    stage_ple_rows(p, b, ids, at=a0 * (ids.size // len(toks)))       # ids [rows, heads]
+                stage_ple(p.table, w.x3, ids)
+            else:
+                stage_ple_rows(p, b, ids)
     b.staged.record()
     return segs
 

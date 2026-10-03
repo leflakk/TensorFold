@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Sequence
 
 import numpy as np
@@ -27,6 +28,17 @@ class Scratch:
         self.lin, self.parity = lin, 0
 
 
+@lru_cache(maxsize=4096)
+def _chains(counts: tuple[int, ...]) -> tuple[np.ndarray, int, int]:
+    """``plan_host`` for a round's streams, each a chain of ``counts`` rows (a plan depends on the lengths alone):
+    its entries then starts as one int32 array, its slots and most rows."""
+
+    entries, starts, slots, most = shared.plan_host([list(range(-1, k - 1)) for k in counts])
+    table = np.asarray(entries + starts, dtype=np.int32)
+    table.flags.writeable = False
+    return table, slots, most
+
+
 class Tables:
     """A round's device tables: rows' streams and conv taps, layers' conv and state pointers, chains, pending rows.
     ``static``: a captured round's device tables (``StaticTables``, one a window shape), refilled here; ``width``:
@@ -44,18 +56,20 @@ class Tables:
             j = np.arange(a1 - a0)[:, None] + taps
             win[a0:a1] = np.where(j < 3, j, a0 + j)            # < 3: a conv state row, else window row tap - 3
             sid[a0:a1] = s
-        entries, starts, slots, most = shared.plan_host([list(range(-1, a1 - a0 - 1)) for _, a0, a1 in segs])
+        chains, slots, most = _chains(tuple(a1 - a0 for _, a0, a1 in segs))
         width = max([len(rows_) for rows_ in pending] + [1]) if width is None else int(width)
         held = np.zeros((n, width), dtype=np.int32)             # each stream's last-round kept rows, not yet folded
         for s, rows_ in enumerate(pending):
             held[s, :len(rows_)] = rows_
         counts = np.asarray([len(rows_) for rows_ in pending], dtype=np.int32)
-        ints = np.concatenate([sid, win.ravel(), np.asarray(entries + starts, dtype=np.int32), held.ravel(), counts])
+        ints = np.concatenate([sid, win.ravel(), chains, held.ravel(), counts])
         ptrs = np.empty((2, lin, n), dtype=np.int64)
-        for s, (st, _, _) in enumerate(segs):
-            for li in range(lin):
-                ptrs[0, li, s] = st.conv[li].data_ptr()
-                ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
+        layers = np.arange(lin, dtype=np.int64)
+        for s, (st, _, _) in enumerate(segs):     # st.conv[li] and st.rec[st.cur[li], li], by their strides
+            conv, rec = st.conv, st.rec
+            ptrs[0, :, s] = conv.data_ptr() + layers * (conv.stride(0) * conv.element_size())
+            ptrs[1, :, s] = rec.data_ptr() + (np.asarray(st.cur, dtype=np.int64) * rec.stride(0)
+                                              + layers * rec.stride(1)) * rec.element_size()
         dev = w.device
         if static is None:
             i32 = shared.to_device(ints.tolist(), torch.int32, dev)

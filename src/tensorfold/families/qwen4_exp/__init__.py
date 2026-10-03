@@ -188,8 +188,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                          "has one): without it every round would decode one token. Serve a checkpoint with the "
                          "head, or pass --no-drafts for the serial reference")
     streams = max(1, int(options.get("parallel") or 1))
-    # 8 RTX 3090s (TP 8): a 0.3 cut decoded as fast or faster than 0.7 in all four bench cells (a verify window's
-    # extra rows cost little next to its fixed launches and collectives); --parallel: a cut by the round's streams
+    # 8 RTX 3090s (TP 8): one stream decodes fastest at a lower cut than on one GPU (a verify window's extra rows
+    # cost little next to its fixed launches and collectives); --parallel: a cut by the round's streams
     if mtp_confidence is not None:
         confidence = float(mtp_confidence)
     elif streams > 1:
