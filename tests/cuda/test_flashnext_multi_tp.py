@@ -74,10 +74,10 @@ def _threads(hub, fns) -> list:
     return results
 
 
-def _solo(w, prompts, samplings) -> list[list[int]]:
+def _solo(w, prompts, samplings, *, capacity: int = 1024, prefill_rows: int = 16) -> list[list[int]]:
     """Each prompt alone on the one-stream engine: its first token, then serial decoding."""
 
-    e = Engine(w, capacity=1024, max_rows=8, prefill_rows=16)
+    e = Engine(w, capacity=capacity, max_rows=8, prefill_rows=prefill_rows)
     out = []
     for prompt, sampling in zip(prompts, samplings):
         out.append(serial_decode(e, prefill(e, prompt, sampling), COUNT, sampling).tokens)
@@ -117,6 +117,34 @@ def test_streams_decoded_together_on_ranks_equal_each_alone(checkpoint, monkeypa
         assert outs == refs[r], r
         assert all(m >= 2 for m in rows[:3]), (r, rows)    # drafting streams verified drafts
     assert all(g[0] == got[0][0] for g in got)
+    ws.clear()
+    torch.cuda.empty_cache()
+
+
+def test_a_lone_prompts_pass_runs_as_two_halves_with_its_bits(checkpoint):
+    """A pass of one long prompt on ranks summing through shared memory: the one-stream engine's paired chunk (two
+    halves whose sums overlap), the prompt's later passes and replies as alone."""
+
+    hub, ws = _ranks(checkpoint, "fast", False)
+    prompts = [_long(1500, 21)]                          # a 1024-row pass (paired), then 476 rows with the kept end
+    refs = _threads(hub, [lambda w=w: _solo(w, prompts, SAMPLINGS[1:2], capacity=4096, prefill_rows=1024)
+                          for w in ws])
+
+    def body(w):
+        dec = MultiDecoder(w, slots=2, capacity=4096, depth=3, confidence=0.3, prefill_rows=1024, graphs="pad")
+        assert dec.pbuf2 is not None and dec.overlap is not None
+        paired, inner = [], dec._pass_pair
+        dec._pass_pair = lambda piece: (paired.append(piece[2]), inner(piece))[1]
+        s = Stream(prompts[0], COUNT, SAMPLINGS[1], stop_eos=False)
+        dec.admit(s)
+        while dec.live():
+            dec.finish(dec.round())
+        return s.out, paired, [k[0] for k in dec.kept]
+
+    for r, (out, paired, kept) in enumerate(_threads(hub, [lambda w=w: body(w) for w in ws])):
+        assert out == refs[r][0], r
+        assert paired == [1024], (r, paired)
+        assert [len(ids) for ids in kept] == [len(prompts[0]) - 1], (r, kept)     # its kept end, one token early
     ws.clear()
     torch.cuda.empty_cache()
 

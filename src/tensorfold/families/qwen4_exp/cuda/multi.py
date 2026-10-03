@@ -18,10 +18,10 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _Profile, _gathered_fits, choose_host, draft, entry_end,
-                     gathered_host, prefill_begin, tp_sample_rows)
+from .decode import (PAIR_MIN, PREFILL_ROWS, WARM_TAIL, Engine, _Profile, _gathered_fits, choose_host, draft,
+                     entry_end, gathered_host, pair_prefill, prefill_begin, prefill_chunk, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes, round_graphs
-from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
+from .forward import Cut, Overlap, commit, compute, compute_mixed, converges, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .prompt_plan import pass_limit
 from .state import ENDS, Buffers, State
@@ -48,12 +48,15 @@ def _agree(w):
     return agree
 
 
-def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
-    """A one-sequence engine over a slot's state and the shared buffers (eager: no CUDA graphs)."""
+def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int,
+          pbuf2: Buffers | None = None, overlap=None) -> Engine:
+    """A one-sequence engine over a slot's state and the shared buffers (eager: no CUDA graphs); ``pbuf2`` and
+    ``overlap``: a lone prompt's pass in two overlapped halves, as the one-stream engine's chunks run."""
 
     e = object.__new__(Engine)
     e.w, e.capacity, e.rows, e.prefill_rows = w, capacity, buf.rows, prefill_rows
     e.buf, e.mbuf, e.pbuf, e.st, e.graphs = buf, mbuf, pbuf, st, None
+    e.pbuf2, e.overlap = pbuf2, overlap
     e.stops = ()
     return e
 
@@ -90,6 +93,12 @@ class MultiDecoder:
         # tensor parallel: the MTP head's experts take the split prefill form, as the one-stream engine's do
         self.mbuf = Buffers(w, rows, capacity, moe_prefill=True if self.tp else None) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
+        # ranks summing through shared memory: a pass of one prompt as two halves whose sums overlap the other's
+        # compute (the one-stream engine's ``prefill_chunk``; +33-39% prompt speed on 8 RTX 3090s)
+        self.pbuf2 = self.overlap = None
+        if pair_prefill(w) and not self.converged:
+            self.pbuf2 = Buffers(w, prefill_rows // 2, capacity, prefill=True)
+            self.overlap = Overlap(w.comm)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         # rounds and MTP steps as CUDA graphs (``round_graphs``): windows padded to depth + 1 rows a stream
         # (``graphs="pad"``: the padded windows and static tables, run eager)
@@ -272,7 +281,8 @@ class MultiDecoder:
             else:                                        # the kept prompt end stays kept
                 self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
             raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
-        e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
+        e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows, self.pbuf2,
+                  self.overlap)
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
         try:
             begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
@@ -348,11 +358,15 @@ class MultiDecoder:
         self._note_passed(pieces)
         t0 = time.perf_counter()
         try:
-            segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
-            ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
-            logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
-            heads = logits[:len(ends)].clone() if ends else None
-            lasts = self._absorb(pieces, segs, cuts)
+            if self.pbuf2 is not None and len(pieces) == 1 and pieces[0][2] // 2 >= PAIR_MIN \
+                    and pieces[0][0].st.image_positions is None:
+                heads, lasts = self._pass_pair(pieces[0])
+            else:
+                segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
+                ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
+                logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
+                heads = logits[:len(ends)].clone() if ends else None
+                lasts = self._absorb(pieces, segs, cuts)
         except Exception as exc:                         # noqa: BLE001  (these requests fail, the others go on)
             if self.tp:                                  # a rank's own failure: the ranks are no longer in step
                 raise
@@ -363,6 +377,20 @@ class MultiDecoder:
             per = (time.perf_counter() - t0) / rows
             self.row_s = per if self.row_s is None else 0.7 * self.row_s + 0.3 * per
         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces))
+
+    def _pass_pair(self, piece) -> tuple:
+        """A pass of one prompt piece through the one-stream engine's ``prefill_chunk`` (two overlapped halves when
+        its kept point allows, the same bits as one chunk): its head (if it ends the prompt) and its last row."""
+
+        s, a, n = piece
+        e, mtp = self.fills[s.sid][0], self.fills[s.sid][1]
+        k = self._point(s, a)
+        keep_at = k if k is not None and a < k <= a + n else None
+        e.kept = None
+        head = prefill_chunk(e, s.prompt, a, mtp=mtp, keep_at=keep_at, end=a + n)
+        if keep_at is not None:                          # the point's state, as ``_absorb`` keeps it
+            self.fills[s.sid][3] = (e.kept["state"], e.kept["tail"])
+        return head, [e.last_streams]
 
     def _note_passed(self, pieces) -> None:
         """Count a pass against every filling prompt it left out; one it took starts over."""
@@ -538,7 +566,7 @@ class MultiDecoder:
                 pends = self._end_rows(pieces, psegs)
                 logits, heads = compute_mixed(self.w, segs, self.buf, psegs, self.pbuf, ends=pends, cuts=cuts)
                 heads = heads[:len(pends)].clone() if pends else None
-            elif graphed and tables.folds:             # a captured shape (a first round folds nothing: eager)
+            elif graphed:                              # a captured shape (first rounds, folding nothing, too)
                 logits = self.rounds.verify(segs, tables, step)
             else:
                 logits = compute(self.w, segs, self.buf)

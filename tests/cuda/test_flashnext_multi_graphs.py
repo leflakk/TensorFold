@@ -69,7 +69,9 @@ def test_rounds_in_graphs_equal_each_alone(apart, graphs, kv_dtype):
     if graphs is True:
         kinds = {key[:2] for key in dec.rounds.graphs}
         assert any(k[0] == "verify" for k in kinds) and any(k[0] == "mtp" for k in kinds), kinds
-        assert {k[1] for k in kinds if k[0] == "verify"} >= {1, 4}             # alone, then four streams
+        # the first round alone (it folds nothing) and four streams: a lone request's first round replays too
+        assert {k[1] for k in kinds if k[0] == "verify"} >= {1, 4}
+        assert any(k[0] == "verify" and k[1] == 1 and not k[3] for k in dec.rounds.graphs)
     assert len(dec.free) + len({id(k[1]) for k in dec.kept}) == 4 and not dec.live()
 
 

@@ -101,7 +101,7 @@ class FlashNextEngine:
         prompt_rows = PREFILL_ROWS + (PREFILL_ROWS // 2 if paired else 0)
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits,
-                                                          world=tp))
+                                                          world=tp, prefill_rows=prompt_rows))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
                                                kept=KEEP_SERIAL + 1, prefill_rows=prompt_rows)))
